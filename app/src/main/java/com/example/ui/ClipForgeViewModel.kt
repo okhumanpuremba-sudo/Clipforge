@@ -60,6 +60,8 @@ data class StudioUiState(
     val includeVideoCaptions: Boolean = true,
     val viralCaptionStyle: String = "HORMOZI_BOLD",
     val localCampaigns: List<WhopCampaign> = emptyList(),
+    val localProjects: List<VideoProject> = emptyList(),
+    val localClips: List<ClipCandidate> = emptyList(),
     val campaignPresets: List<CampaignPreset> = emptyList(),
     val activePresetId: String? = null,
     val isIngestingUrl: Boolean = false,
@@ -140,13 +142,17 @@ class ClipForgeViewModel(
     val studioState: StateFlow<StudioUiState> = _studioState.asStateFlow()
 
     val projectsState: StateFlow<DataStreamState<List<VideoProject>>> =
-        repository.observeProjects(currentUserId)
-            .map<List<VideoProject>, DataStreamState<List<VideoProject>>> { list ->
-                if (_studioState.value.selectedProjectId == null && list.isNotEmpty()) {
-                    _studioState.update { it.copy(selectedProjectId = list.first().id) }
-                }
-                DataStreamState.Success(list)
+        combine(
+            repository.observeProjects(currentUserId).catch { emit(emptyList()) },
+            _studioState.map { it.localProjects }
+        ) { remoteList, localList ->
+            val remoteIds = remoteList.map { it.id }.toSet()
+            val merged = localList.filterNot { it.id in remoteIds } + remoteList
+            if (_studioState.value.selectedProjectId == null && merged.isNotEmpty()) {
+                _studioState.update { it.copy(selectedProjectId = merged.first().id) }
             }
+            DataStreamState.Success(merged) as DataStreamState<List<VideoProject>>
+        }
             .catch { error ->
                 Log.w(TAG, "Error observing projects", error)
                 emit(DataStreamState.Error(error.message ?: "Failed to load projects"))
@@ -184,18 +190,32 @@ class ClipForgeViewModel(
 
     val clipsState: StateFlow<DataStreamState<List<ClipCandidate>>> =
         combine(
-            repository.observeClips(currentUserId),
+            repository.observeClips(currentUserId).catch { emit(emptyList()) },
+            _studioState.map { it.localClips },
             _studioState.map { it.localExtendedConfigs }
-        ) { list, extMap ->
-            if (_studioState.value.selectedClipId == null && list.isNotEmpty()) {
-                _studioState.update { it.copy(selectedClipId = list.first().id) }
+        ) { remoteList, localList, extMap ->
+            val localById = localList.associateBy { it.id }
+            val mergedRaw = (localList + remoteList.filterNot { it.id in localById.keys })
+                .distinctBy { "${it.projectId}_${it.title}_${it.startSec}" }
+            if (_studioState.value.selectedClipId == null && mergedRaw.isNotEmpty()) {
+                val activeProjId = _studioState.value.selectedProjectId
+                val preferredClip = mergedRaw.firstOrNull { it.projectId == activeProjId } ?: mergedRaw.first()
+                _studioState.update { it.copy(selectedClipId = preferredClip.id) }
             }
-            val hydrated = list.map { clip ->
-                val ext = extMap[clip.id] ?: LocalClipTimelineStore.loadExtendedConfigForClip(
-                    context = appContext,
-                    clip = clip
-                )
-                clip.copy(extendedConfig = ext)
+            val hydrated = mergedRaw.map { clip ->
+                val ensuredEndSec = if (clip.endSec - clip.startSec < 22L) {
+                    clip.startSec + 26L
+                } else {
+                    clip.endSec
+                }
+                val normalizedClip = clip.copy(endSec = ensuredEndSec)
+                val ext = extMap[normalizedClip.id]
+                    ?: normalizedClip.extendedConfig
+                    ?: LocalClipTimelineStore.loadExtendedConfigForClip(
+                        context = appContext,
+                        clip = normalizedClip
+                    )
+                normalizedClip.copy(extendedConfig = ext)
             }
             DataStreamState.Success(hydrated) as DataStreamState<List<ClipCandidate>>
         }
@@ -223,7 +243,17 @@ class ClipForgeViewModel(
             )
 
     fun selectProject(projectId: String) {
-        _studioState.update { it.copy(selectedProjectId = projectId, errorBanner = null) }
+        val currentClips = (clipsState.value as? DataStreamState.Success)?.data.orEmpty()
+        val firstClipForProject = currentClips.firstOrNull { it.projectId == projectId }
+        val projFrame = _studioState.value.uploadedPreviewFrames[projectId]?.firstOrNull()
+        _studioState.update {
+            it.copy(
+                selectedProjectId = projectId,
+                selectedClipId = firstClipForProject?.id ?: it.selectedClipId,
+                singleClipPreviewFrame = projFrame ?: it.singleClipPreviewFrame,
+                errorBanner = null
+            )
+        }
     }
 
     fun selectCampaign(campaignId: String) {
@@ -243,17 +273,26 @@ class ClipForgeViewModel(
     }
 
     fun selectClip(clipId: String, context: Context? = null, sourceUri: String = "", startSec: Long = 0L) {
+        val currentClips = (clipsState.value as? DataStreamState.Success)?.data.orEmpty()
+        val targetClip = currentClips.firstOrNull { it.id == clipId }
+        val projFrames = targetClip?.projectId?.let { _studioState.value.uploadedPreviewFrames[it] }.orEmpty()
         _studioState.update {
             it.copy(
                 selectedClipId = clipId,
+                selectedProjectId = targetClip?.projectId?.ifBlank { it.selectedProjectId } ?: it.selectedProjectId,
+                singleClipPreviewFrame = projFrames.firstOrNull() ?: it.singleClipPreviewFrame,
                 errorBanner = null,
                 lastExportSummary = null
             )
         }
-        if (context != null && sourceUri.startsWith("content://")) {
+        val canExtractLocalVideo = sourceUri.startsWith("content://") ||
+            (sourceUri.isNotBlank() && !sourceUri.startsWith("http://") && !sourceUri.startsWith("https://"))
+        if (context != null && canExtractLocalVideo) {
             viewModelScope.launch {
                 val frame = VideoProcessingPipeline.extractSinglePreviewFrame(context, sourceUri, startSec)
-                _studioState.update { it.copy(singleClipPreviewFrame = frame) }
+                if (frame != null) {
+                    _studioState.update { it.copy(singleClipPreviewFrame = frame) }
+                }
             }
         }
     }
@@ -270,26 +309,35 @@ class ClipForgeViewModel(
             _studioState.update {
                 it.copy(
                     isIngestingUrl = true,
-                    pipelineProgress = 0.14f,
-                    pipelineStageLabel = "Step 1/4: Fetching stream metadata, duration & chapters...",
-                    analysisStatusBanner = "Fetching live metadata, chapters & captions from link...",
+                    pipelineProgress = 0.12f,
+                    pipelineStageLabel = "Step 1/4: Fetching stream metadata, video stream & chapters...",
+                    analysisStatusBanner = "Fetching live video stream, chapters, heatmap & captions...",
                     errorBanner = null
                 )
             }
 
-            val ingestResult = UrlVideoIngestEngine.ingestStreamUrl(rawUrl, userFocusNotes)
-            ingestResult.onSuccess { ingested ->
-                _studioState.update {
-                    it.copy(
-                        pipelineProgress = 0.34f,
-                        pipelineStageLabel = "Step 2/4: Extracted ${ingested.platform.label} captions & thumbnail frame..."
-                    )
+            val ingestResult = UrlVideoIngestEngine.ingestStreamUrl(
+                rawUrl = rawUrl,
+                userFocusNotes = userFocusNotes,
+                storageDir = appContext?.filesDir,
+                onProgress = { statusMsg, pct ->
+                    _studioState.update {
+                        it.copy(
+                            pipelineProgress = pct.coerceIn(0.12f, 0.40f),
+                            pipelineStageLabel = statusMsg,
+                            analysisStatusBanner = statusMsg
+                        )
+                    }
                 }
+            )
+            ingestResult.onSuccess { ingested ->
+                val resolvedSourceUri = ingested.downloadedLocalMp4Path.ifBlank { ingested.normalizedUrl }.take(500)
                 val newProject = VideoProject(
+                    userId = currentUserId,
                     title = ingested.title.take(120),
                     sourceFileName = "${ingested.platform.label} • ${ingested.authorOrChannel} (${ingested.externalId})".take(200),
-                    sourceUri = ingested.normalizedUrl.take(500),
-                    durationSec = ingested.durationSec.coerceIn(15L, 36000L),
+                    sourceUri = resolvedSourceUri,
+                    durationSec = ingested.durationSec.coerceIn(30L, 36000L),
                     width = ingested.width,
                     height = ingested.height,
                     transcriptText = ingested.extractedTranscriptOrContext.take(15000),
@@ -298,47 +346,42 @@ class ClipForgeViewModel(
                     clipCount = 0L
                 )
 
-                val saveRes = repository.createProject(newProject)
-                saveRes.onSuccess { newProjectId ->
-                    val savedProject = newProject.copy(id = newProjectId)
-                    _studioState.update { st ->
-                        val updatedFrames = if (ingested.thumbnailBitmap != null) {
-                            st.uploadedPreviewFrames + (newProjectId to listOf(ingested.thumbnailBitmap))
-                        } else {
-                            st.uploadedPreviewFrames
-                        }
-                        st.copy(
-                            isIngestingUrl = false,
-                            pipelineProgress = if (autoFindViralClips) 0.42f else 1f,
-                            pipelineStageLabel = if (autoFindViralClips) {
-                                "Step 3/4: Launching AI viral highlight detector..."
-                            } else {
-                                "Completed link import (100%)"
-                            },
-                            selectedProjectId = newProjectId,
-                            uploadedPreviewFrames = updatedFrames,
-                            singleClipPreviewFrame = ingested.thumbnailBitmap ?: st.singleClipPreviewFrame,
-                            analysisStatusBanner = "Ingested ${ingested.platform.label} link '${ingested.title}' (${ingested.extractionSourceLabel})."
-                        )
-                    }
+                val createRes = repository.createProject(newProject)
+                val newProjectId = createRes.getOrNull()?.takeIf { it.isNotBlank() }
+                    ?: "local_proj_${System.currentTimeMillis()}"
+                val savedProject = newProject.copy(id = newProjectId, userId = currentUserId)
+                val extractedSceneFrames = ingested.sceneFrames.ifEmpty {
+                    listOfNotNull(ingested.thumbnailBitmap)
+                }
 
-                    if (autoFindViralClips) {
-                        runAiHighlightPipeline(
-                            project = savedProject,
-                            campaign = campaign,
-                            onCompleteNavigateToReview = onNavigateToReview
-                        )
+                _studioState.update { st ->
+                    val updatedFrames = if (extractedSceneFrames.isNotEmpty()) {
+                        st.uploadedPreviewFrames + (newProjectId to extractedSceneFrames)
+                    } else {
+                        st.uploadedPreviewFrames
                     }
-                }.onFailure { err ->
-                    _studioState.update {
-                        it.copy(
-                            isIngestingUrl = false,
-                            pipelineProgress = 0f,
-                            pipelineStageLabel = "",
-                            analysisStatusBanner = null,
-                            errorBanner = err.localizedMessage ?: "Failed to save link project."
-                        )
-                    }
+                    st.copy(
+                        isIngestingUrl = false,
+                        localProjects = listOf(savedProject) + st.localProjects.filterNot { it.id == newProjectId },
+                        pipelineProgress = if (autoFindViralClips) 0.42f else 1f,
+                        pipelineStageLabel = if (autoFindViralClips) {
+                            "Step 3/4: Launching AI viral highlight detector (>20s clips)..."
+                        } else {
+                            "Completed link import (100%)"
+                        },
+                        selectedProjectId = newProjectId,
+                        uploadedPreviewFrames = updatedFrames,
+                        singleClipPreviewFrame = extractedSceneFrames.firstOrNull() ?: st.singleClipPreviewFrame,
+                        analysisStatusBanner = "Ingested ${ingested.platform.label} '${ingested.title}' (${ingested.extractionSourceLabel}, ${extractedSceneFrames.size} video scene frames)."
+                    )
+                }
+
+                if (autoFindViralClips) {
+                    runAiHighlightPipeline(
+                        project = savedProject,
+                        campaign = campaign,
+                        onCompleteNavigateToReview = onNavigateToReview
+                    )
                 }
             }.onFailure { err ->
                 _studioState.update {
@@ -403,33 +446,33 @@ class ClipForgeViewModel(
                     buildDefaultTranscriptForDuration(projectTitle, meta.durationSec)
                 }
 
-                val result = repository.createProject(
-                    VideoProject(
-                        title = projectTitle,
-                        sourceFileName = meta.fileName,
-                        sourceUri = uri.toString(),
-                        durationSec = meta.durationSec,
-                        width = meta.width,
-                        height = meta.height,
-                        transcriptText = defaultTranscript,
-                        campaignId = campaignId,
-                        status = "READY",
-                        clipCount = 0L
-                    )
+                val newProj = VideoProject(
+                    userId = currentUserId,
+                    title = projectTitle,
+                    sourceFileName = meta.fileName,
+                    sourceUri = uri.toString(),
+                    durationSec = meta.durationSec.coerceAtLeast(30L),
+                    width = meta.width,
+                    height = meta.height,
+                    transcriptText = defaultTranscript,
+                    campaignId = campaignId,
+                    status = "READY",
+                    clipCount = 0L
                 )
-                result.onSuccess { newId ->
-                    _studioState.update { state ->
-                        val updatedFrames = if (meta.sampleFrames.isNotEmpty()) {
-                            state.uploadedPreviewFrames + (newId to meta.sampleFrames)
-                        } else state.uploadedPreviewFrames
-                        state.copy(
-                            selectedProjectId = newId,
-                            uploadedPreviewFrames = updatedFrames,
-                            analysisStatusBanner = "Imported '${meta.fileName}' (${meta.width}x${meta.height}, ${meta.durationSec}s, ${meta.sampleFrames.size} keyframes extracted)."
-                        )
-                    }
-                }.onFailure { err ->
-                    _studioState.update { it.copy(errorBanner = err.localizedMessage ?: "Failed to save project", analysisStatusBanner = null) }
+                val result = repository.createProject(newProj)
+                val newId = result.getOrNull()?.takeIf { it.isNotBlank() } ?: "local_proj_${System.currentTimeMillis()}"
+                val savedProj = newProj.copy(id = newId, userId = currentUserId)
+                _studioState.update { state ->
+                    val updatedFrames = if (meta.sampleFrames.isNotEmpty()) {
+                        state.uploadedPreviewFrames + (newId to meta.sampleFrames)
+                    } else state.uploadedPreviewFrames
+                    state.copy(
+                        selectedProjectId = newId,
+                        localProjects = listOf(savedProj) + state.localProjects.filterNot { it.id == newId },
+                        uploadedPreviewFrames = updatedFrames,
+                        singleClipPreviewFrame = meta.sampleFrames.firstOrNull() ?: state.singleClipPreviewFrame,
+                        analysisStatusBanner = "Imported '${meta.fileName}' (${meta.width}x${meta.height}, ${meta.durationSec}s, ${meta.sampleFrames.size} keyframes extracted)."
+                    )
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -450,38 +493,43 @@ class ClipForgeViewModel(
                 [02:48] Caster (Gaming Highlight): Pixel-perfect movement across the gap, zero health remaining, and locks in the world record pace!
             """.trimIndent()
 
-            val result = repository.createProject(
-                VideoProject(
-                    title = "Pro Finals & Streamer Breakdown VOD",
-                    sourceFileName = "finals_championship_1080p60.mp4",
-                    sourceUri = "",
-                    durationSec = 210L,
-                    width = 1920L,
-                    height = 1080L,
-                    transcriptText = sampleTranscript,
-                    campaignId = selectedCampaignId,
-                    status = "READY",
-                    clipCount = 0L
-                )
+            val sampleProj = VideoProject(
+                userId = currentUserId,
+                title = "Pro Finals & Streamer Breakdown VOD",
+                sourceFileName = "finals_championship_1080p60.mp4",
+                sourceUri = "",
+                durationSec = 210L,
+                width = 1920L,
+                height = 1080L,
+                transcriptText = sampleTranscript,
+                campaignId = selectedCampaignId,
+                status = "READY",
+                clipCount = 0L
             )
-            result.onSuccess { id ->
-                _studioState.update {
-                    it.copy(
-                        selectedProjectId = id,
-                        analysisStatusBanner = "Created sample VOD project with timecoded transcript. Ready for AI Highlight Detection."
-                    )
-                }
-            }.onFailure { err ->
-                _studioState.update { it.copy(errorBanner = err.localizedMessage ?: "Failed to create sample project") }
+            val result = repository.createProject(sampleProj)
+            val id = result.getOrNull()?.takeIf { it.isNotBlank() } ?: "local_proj_${System.currentTimeMillis()}"
+            val savedSample = sampleProj.copy(id = id, userId = currentUserId)
+            _studioState.update {
+                it.copy(
+                    selectedProjectId = id,
+                    localProjects = listOf(savedSample) + it.localProjects.filterNot { p -> p.id == id },
+                    analysisStatusBanner = "Created sample VOD project with timecoded transcript. Ready for AI Highlight Detection."
+                )
             }
         }
     }
 
     fun deleteProject(projectId: String) {
         viewModelScope.launch {
-            repository.deleteProject(projectId)
-            if (_studioState.value.selectedProjectId == projectId) {
-                _studioState.update { it.copy(selectedProjectId = null) }
+            if (!projectId.startsWith("local_proj_")) {
+                repository.deleteProject(projectId)
+            }
+            _studioState.update {
+                it.copy(
+                    selectedProjectId = if (it.selectedProjectId == projectId) null else it.selectedProjectId,
+                    localProjects = it.localProjects.filterNot { p -> p.id == projectId },
+                    localClips = it.localClips.filterNot { c -> c.projectId == projectId }
+                )
             }
         }
     }
@@ -538,7 +586,7 @@ class ClipForgeViewModel(
                 payoutPer1kViews = "$2.00 / 1K views",
                 targetPlatform = "TIKTOK",
                 preferredAspectRatio = "9:16",
-                minDurationSec = 15L,
+                minDurationSec = 22L,
                 maxDurationSec = 55L,
                 logoPlacement = "TOP_RIGHT",
                 requiredLogoAsset = "whop_partner_badge.png",
@@ -693,18 +741,17 @@ class ClipForgeViewModel(
                     )
                 }
 
-                var firstClipId: String? = null
-                outcome.clips.forEach { candidate ->
-                    val saved = repository.createClip(candidate)
-                    if (firstClipId == null && saved.isSuccess) {
-                        firstClipId = saved.getOrNull()
-                    }
-                }
+                val savedClips = persistClipsBatchWithImmediateState(
+                    candidates = outcome.clips,
+                    project = project,
+                    campaign = campaign
+                )
+                val firstClipId = savedClips.firstOrNull()?.id
 
                 repository.updateProjectStatus(
                     projectId = project.id,
                     status = "CLIPS_GENERATED",
-                    clipCount = outcome.clips.size.toLong(),
+                    clipCount = savedClips.size.toLong(),
                     campaignId = campaign?.id
                 )
 
@@ -712,7 +759,7 @@ class ClipForgeViewModel(
                     ApiUsageLog(
                         providerId = outcome.providerId,
                         modelName = outcome.modelUsed,
-                        operation = "detect_highlights (${outcome.clips.size} clips)",
+                        operation = "detect_highlights (${savedClips.size} clips)",
                         latencyMs = outcome.latencyMs,
                         estimatedTokens = outcome.estimatedTokens,
                         retryCount = outcome.retryCount.toLong(),
@@ -734,10 +781,11 @@ class ClipForgeViewModel(
                     st.copy(
                         isAnalyzingHighlights = false,
                         pipelineProgress = 1.0f,
-                        pipelineStageLabel = "Complete (100%) — ${outcome.clips.size} viral clip(s) ready!",
+                        pipelineStageLabel = "Complete (100%) — ${savedClips.size} viral clip(s) (>20s each) ready!",
+                        selectedProjectId = project.id,
                         selectedClipId = firstClipId ?: st.selectedClipId,
                         providers = updatedProviders,
-                        analysisStatusBanner = "Generated ${outcome.clips.size} timestamped clip(s) via ${outcome.modelUsed} (${outcome.latencyMs}ms, ~${outcome.estimatedTokens} tokens)."
+                        analysisStatusBanner = "Generated ${savedClips.size} viral clip(s) (>20s each) via ${outcome.modelUsed} (${outcome.latencyMs}ms, ~${outcome.estimatedTokens} tokens)."
                     )
                 }
                 onCompleteNavigateToReview()
@@ -761,8 +809,8 @@ class ClipForgeViewModel(
                 _studioState.update {
                     it.copy(
                         pipelineProgress = 0.78f,
-                        pipelineStageLabel = "Step 4/4: Extracting $desiredCount viral clip(s) via On-Device Rule Engine...",
-                        analysisStatusBanner = "Auto-switched to On-Device Viral Clipper — extracting $desiredCount clip(s) with ${stateSnap.viralCaptionStyle.replace("_", " ")} captions...",
+                        pipelineStageLabel = "Step 4/4: Extracting $desiredCount viral clip(s) (>20s each) via On-Device Rule Engine...",
+                        analysisStatusBanner = "Auto-switched to On-Device Viral Clipper — extracting $desiredCount clip(s) (>20s each) with ${stateSnap.viralCaptionStyle.replace("_", " ")} captions...",
                         errorBanner = null
                     )
                 }
@@ -775,18 +823,17 @@ class ClipForgeViewModel(
                     viralCaptionStyle = stateSnap.viralCaptionStyle
                 )
 
-                var firstFallbackClipId: String? = null
-                fallbackClips.forEach { candidate ->
-                    val saved = repository.createClip(candidate)
-                    if (firstFallbackClipId == null && saved.isSuccess) {
-                        firstFallbackClipId = saved.getOrNull()
-                    }
-                }
+                val savedFallbackClips = persistClipsBatchWithImmediateState(
+                    candidates = fallbackClips,
+                    project = project,
+                    campaign = campaign
+                )
+                val firstFallbackClipId = savedFallbackClips.firstOrNull()?.id
 
                 repository.updateProjectStatus(
                     projectId = project.id,
                     status = "CLIPS_GENERATED",
-                    clipCount = fallbackClips.size.toLong(),
+                    clipCount = savedFallbackClips.size.toLong(),
                     campaignId = campaign?.id
                 )
 
@@ -794,10 +841,11 @@ class ClipForgeViewModel(
                     st.copy(
                         isAnalyzingHighlights = false,
                         pipelineProgress = 1.0f,
-                        pipelineStageLabel = "Complete (100%) — ${fallbackClips.size} viral clip(s) ready!",
+                        pipelineStageLabel = "Complete (100%) — ${savedFallbackClips.size} viral clip(s) (>20s each) ready!",
+                        selectedProjectId = project.id,
                         selectedClipId = firstFallbackClipId ?: st.selectedClipId,
                         errorBanner = null,
-                        analysisStatusBanner = "Generated ${fallbackClips.size} viral clip(s) with ${stateSnap.viralCaptionStyle.replace("_", " ")} captions (${if (stateSnap.includeVideoCaptions) "ON" else "OFF"})."
+                        analysisStatusBanner = "Generated ${savedFallbackClips.size} viral clip(s) (>20s each) for '${project.title}' with ${stateSnap.viralCaptionStyle.replace("_", " ")} captions."
                     )
                 }
                 onCompleteNavigateToReview()
@@ -822,8 +870,8 @@ class ClipForgeViewModel(
                 it.copy(
                     isAnalyzingHighlights = true,
                     pipelineProgress = 0.35f,
-                    pipelineStageLabel = "Scanning transcript timestamps ($desiredCount clips, 0 API tokens)...",
-                    analysisStatusBanner = "Running 0-Token Local Rule Clipper ($desiredCount clips, 0 API tokens)...",
+                    pipelineStageLabel = "Scanning transcript timestamps ($desiredCount clips >20s, 0 API tokens)...",
+                    analysisStatusBanner = "Running 0-Token Local Rule Clipper ($desiredCount clips >20s, 0 API tokens)...",
                     errorBanner = null
                 )
             }
@@ -841,41 +889,101 @@ class ClipForgeViewModel(
                 includeVideoCaptions = stateSnap.includeVideoCaptions,
                 viralCaptionStyle = stateSnap.viralCaptionStyle
             )
-            var firstClipId: String? = null
-            generated.forEach { candidate ->
-                val saved = repository.createClip(candidate)
-                if (firstClipId == null && saved.isSuccess) {
-                    firstClipId = saved.getOrNull()
-                }
-            }
+            val savedClips = persistClipsBatchWithImmediateState(
+                candidates = generated,
+                project = project,
+                campaign = campaign
+            )
+            val firstClipId = savedClips.firstOrNull()?.id
             repository.updateProjectStatus(
                 projectId = project.id,
                 status = "CLIPS_GENERATED",
-                clipCount = generated.size.toLong(),
+                clipCount = savedClips.size.toLong(),
                 campaignId = campaign?.id
             )
             _studioState.update { st ->
                 st.copy(
                     isAnalyzingHighlights = false,
                     pipelineProgress = 1.0f,
-                    pipelineStageLabel = "Complete (100%) — ${generated.size} local clip(s) ready!",
+                    pipelineStageLabel = "Complete (100%) — ${savedClips.size} local clip(s) (>20s each) ready!",
+                    selectedProjectId = project.id,
                     selectedClipId = firstClipId ?: st.selectedClipId,
-                    analysisStatusBanner = "Generated ${generated.size} timestamped clip(s) via 0-Token Local Rule Engine (0 API tokens used)."
+                    analysisStatusBanner = "Generated ${savedClips.size} timestamped clip(s) (>20s each) for '${project.title}' via 0-Token Local Rule Engine."
                 )
             }
             onCompleteNavigateToReview()
         }
     }
 
+    private suspend fun persistClipsBatchWithImmediateState(
+        candidates: List<ClipCandidate>,
+        project: VideoProject,
+        campaign: WhopCampaign?
+    ): List<ClipCandidate> {
+        val savedList = mutableListOf<ClipCandidate>()
+        val newExtEntries = mutableMapOf<String, ClipExtendedConfig>()
+
+        candidates.forEachIndexed { index, rawCandidate ->
+            val enforcedEnd = if (rawCandidate.endSec - rawCandidate.startSec < 22L) {
+                rawCandidate.startSec + 26L
+            } else {
+                rawCandidate.endSec
+            }
+            val candidate = rawCandidate.copy(
+                projectId = project.id,
+                userId = currentUserId,
+                endSec = enforcedEnd
+            )
+            val savedRes = repository.createClip(candidate)
+            val resolvedId = savedRes.getOrNull()?.takeIf { it.isNotBlank() }
+                ?: "local_clip_${System.currentTimeMillis()}_${index + 1}"
+
+            val ext = (candidate.extendedConfig ?: AutoFramingEngine.generateDefaultExtendedConfig(
+                clip = candidate.copy(id = resolvedId),
+                project = project,
+                campaign = campaign
+            )).copy(clipId = resolvedId, projectId = project.id)
+
+            if (appContext != null) {
+                LocalClipTimelineStore.saveExtendedConfig(appContext, ext)
+            }
+            newExtEntries[resolvedId] = ext
+            savedList.add(candidate.copy(id = resolvedId, extendedConfig = ext))
+        }
+
+        _studioState.update { st ->
+            val remainingLocalClips = st.localClips.filterNot { it.projectId == project.id }
+            st.copy(
+                localClips = savedList + remainingLocalClips,
+                localExtendedConfigs = st.localExtendedConfigs + newExtEntries
+            )
+        }
+        return savedList
+    }
+
     fun updateClipCandidate(updatedClip: ClipCandidate) {
         viewModelScope.launch {
-            val ext = updatedClip.extendedConfig
-            if (ext != null) {
-                saveExtendedConfigInternal(updatedClip.id, ext)
+            val ensuredEnd = if (updatedClip.endSec - updatedClip.startSec < 22L) {
+                updatedClip.startSec + 22L
+            } else {
+                updatedClip.endSec
             }
-            val res = repository.updateClip(updatedClip)
-            res.onFailure { err ->
-                _studioState.update { it.copy(errorBanner = err.localizedMessage ?: "Failed to update clip") }
+            val normalizedClip = updatedClip.copy(endSec = ensuredEnd)
+            val ext = normalizedClip.extendedConfig
+            if (ext != null) {
+                saveExtendedConfigInternal(normalizedClip.id, ext)
+            }
+            _studioState.update { st ->
+                val updatedLocal = st.localClips.map {
+                    if (it.id == normalizedClip.id) normalizedClip else it
+                }
+                st.copy(localClips = updatedLocal)
+            }
+            if (!normalizedClip.id.startsWith("local_clip_")) {
+                val res = repository.updateClip(normalizedClip)
+                res.onFailure { err ->
+                    _studioState.update { it.copy(errorBanner = err.localizedMessage ?: "Failed to update clip") }
+                }
             }
         }
     }
@@ -1027,10 +1135,13 @@ class ClipForgeViewModel(
             if (appContext != null) {
                 LocalClipTimelineStore.deleteExtendedConfig(appContext, clipId)
             }
-            repository.deleteClip(clipId)
+            if (!clipId.startsWith("local_clip_")) {
+                repository.deleteClip(clipId)
+            }
             _studioState.update { st ->
                 st.copy(
                     selectedClipId = if (st.selectedClipId == clipId) null else st.selectedClipId,
+                    localClips = st.localClips.filterNot { it.id == clipId },
                     localExtendedConfigs = st.localExtendedConfigs - clipId,
                     analysisStatusBanner = "Deleted clip from library."
                 )
@@ -1054,23 +1165,25 @@ class ClipForgeViewModel(
         project: VideoProject?
     ) {
         viewModelScope.launch {
-            val ext = clip.extendedConfig ?: LocalClipTimelineStore.loadExtendedConfigForClip(context, clip, project, campaign)
+            val allProjects = (projectsState.value as? DataStreamState.Success)?.data.orEmpty()
+            val resolvedProject = allProjects.firstOrNull { it.id == clip.projectId } ?: project
+            val ext = clip.extendedConfig ?: LocalClipTimelineStore.loadExtendedConfigForClip(context, clip, resolvedProject, campaign)
             val exportedClip = clip.copy(
                 reviewStatus = "EXPORTED",
                 logoPlacement = if (ext.logoConfig.enabled) ext.logoConfig.position else "NONE",
                 extendedConfig = ext
             )
-            repository.updateClip(exportedClip)
-            if (project != null) {
-                repository.updateProjectStatus(project.id, "EXPORTED", project.clipCount, campaign?.id)
+            updateClipCandidate(exportedClip)
+            if (resolvedProject != null && !resolvedProject.id.startsWith("local_proj_")) {
+                repository.updateProjectStatus(resolvedProject.id, "EXPORTED", resolvedProject.clipCount, campaign?.id)
             }
 
             val result = VideoProcessingPipeline.exportClipPackage(
                 context = context,
                 clip = exportedClip,
                 campaign = campaign,
-                sourceUriString = project?.sourceUri.orEmpty(),
-                sourceFileName = project?.sourceFileName ?: "source_video.mp4"
+                sourceUriString = resolvedProject?.sourceUri.orEmpty(),
+                sourceFileName = resolvedProject?.sourceFileName ?: "source_video.mp4"
             )
 
             when (result) {
@@ -1111,7 +1224,7 @@ class ClipForgeViewModel(
     }
 
     /**
-     * Renders and saves the finished 9:16 vertical clip directly to the Android Gallery
+     * Renders and saves the finished >20s 9:16 vertical clip directly to the Android Gallery
      * (`Movies/ClipForgeAI`) and verifies file existence, size > 0, and valid duration.
      */
     fun saveClipToGallery(
@@ -1122,24 +1235,33 @@ class ClipForgeViewModel(
     ) {
         if (_studioState.value.isSavingToGallery) return
         viewModelScope.launch {
-            val ext = clip.extendedConfig ?: LocalClipTimelineStore.loadExtendedConfigForClip(context, clip, project, campaign)
+            val allProjects = (projectsState.value as? DataStreamState.Success)?.data.orEmpty()
+            val resolvedProject = allProjects.firstOrNull { it.id == clip.projectId } ?: project
+            val ensuredEnd = if (clip.endSec - clip.startSec < 22L) clip.startSec + 26L else clip.endSec
+            val normalizedClip = clip.copy(endSec = ensuredEnd)
+            val ext = normalizedClip.extendedConfig
+                ?: LocalClipTimelineStore.loadExtendedConfigForClip(context, normalizedClip, resolvedProject, campaign)
+
             _studioState.update {
                 it.copy(
                     isSavingToGallery = true,
-                    analysisStatusBanner = "Rendering 9:16 vertical video (${ext.exportConfig.resolution} @ ${ext.exportConfig.fps}fps) & saving to Android Gallery...",
+                    analysisStatusBanner = "Rendering ${normalizedClip.durationSec}s 9:16 vertical video (${ext.exportConfig.resolution} @ ${ext.exportConfig.fps}fps) & saving to Android Gallery...",
                     errorBanner = null
                 )
             }
 
-            val previewBmp = _studioState.value.singleClipPreviewFrame
-                ?: project?.id?.let { _studioState.value.uploadedPreviewFrames[it]?.firstOrNull() }
+            val projectFrames = resolvedProject?.id?.let { _studioState.value.uploadedPreviewFrames[it] }.orEmpty()
+            val previewBmp = projectFrames.firstOrNull()
+                ?: _studioState.value.singleClipPreviewFrame
 
             val saveRes = GalleryVideoSaver.saveClipToAndroidGallery(
                 context = context,
-                clip = clip.copy(extendedConfig = ext),
+                clip = normalizedClip.copy(extendedConfig = ext),
                 extendedConfig = ext,
                 campaign = campaign,
-                sourceFrame = previewBmp
+                sourceFrame = previewBmp,
+                sourceFrames = projectFrames,
+                sourceVideoUriOrPath = resolvedProject?.sourceUri.orEmpty()
             )
 
             when (saveRes) {
@@ -1151,19 +1273,19 @@ class ClipForgeViewModel(
                         lastRenderError = "",
                         checkpointStage = "SAVED_TO_GALLERY"
                     )
-                    saveExtendedConfigInternal(clip.id, updatedExt)
-                    val exportedClip = clip.copy(
+                    saveExtendedConfigInternal(normalizedClip.id, updatedExt)
+                    val exportedClip = normalizedClip.copy(
                         reviewStatus = "EXPORTED",
                         logoPlacement = if (ext.logoConfig.enabled) ext.logoConfig.position else "NONE",
                         extendedConfig = updatedExt
                     )
-                    repository.updateClip(exportedClip)
+                    updateClipCandidate(exportedClip)
 
                     val ffmpegCmd = VideoProcessingPipeline.buildFfmpegWorkerCommand(
                         clip = exportedClip,
                         campaign = campaign,
-                        sourceFileName = project?.sourceFileName ?: "source_video.mp4",
-                        sourceUriString = project?.sourceUri.orEmpty()
+                        sourceFileName = resolvedProject?.sourceFileName ?: "source_video.mp4",
+                        sourceUriString = resolvedProject?.sourceUri.orEmpty()
                     )
 
                     _studioState.update {
@@ -1173,7 +1295,7 @@ class ClipForgeViewModel(
                             lastSavedMp4Path = saveRes.localMp4File.absolutePath,
                             lastExportSummary = "Saved to Gallery: ${saveRes.folderPath} • Verified ${saveRes.sizeBytes} bytes, ${saveRes.durationSec}s duration.",
                             lastExportFfmpegCommand = ffmpegCmd,
-                            analysisStatusBanner = "Saved '${saveRes.fileName}' to Android Gallery (${saveRes.folderPath}) — Ready for TikTok, Reels & Shorts!"
+                            analysisStatusBanner = "Saved ${saveRes.durationSec}s clip '${saveRes.fileName}' to Android Gallery (${saveRes.folderPath}) — Ready for TikTok, Reels & Shorts!"
                         )
                     }
                 }
@@ -1183,7 +1305,7 @@ class ClipForgeViewModel(
                         lastRenderError = saveRes.reason,
                         checkpointStage = "GALLERY_SAVE_FAILED"
                     )
-                    saveExtendedConfigInternal(clip.id, updatedExt)
+                    saveExtendedConfigInternal(normalizedClip.id, updatedExt)
                     _studioState.update {
                         it.copy(
                             isSavingToGallery = false,

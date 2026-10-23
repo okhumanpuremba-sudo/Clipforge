@@ -280,4 +280,64 @@ class ExampleRobolectricTest {
         assertTrue("Hook duration window must be enforced", cmdHookOnSubOff.contains("between(t,0.0,4.0)"))
         assertFalse("Dialogue subtitles must be omitted when subtitlesEnabled is false", cmdHookOnSubOff.contains("subtitles="))
     }
+
+    @Test
+    fun `test 14 - every generated and exported viral clip is strictly over 20 seconds`() = runBlocking {
+        val project = VideoProject(
+            id = "proj_yt_viral",
+            title = "IShowSpeed & Cole Palmer Meet After Chelsea Match",
+            sourceFileName = "YouTube • IShowSpeed (abc123xyz)",
+            durationSec = 240L,
+            transcriptText = """
+                [00:12] Speed: Yo Cole Palmer!! Cold Palmer celebration live right now, chat clip that!
+                [00:48] Cole Palmer & Speed (Funny Moment): Wait no way you actually did the shiver celebration in the tunnel!
+                [01:35] Speed (High Reaction): UNBELIEVABLE MOMENT! Look at that pass and reaction!
+                [02:18] Closing reaction and breakdown for the stream!
+            """.trimIndent()
+        )
+        val campaign = WhopCampaign(
+            id = "camp_viral_20s",
+            name = "Viral Clipping Bounty",
+            minDurationSec = 22L,
+            maxDurationSec = 55L
+        )
+
+        val generatedClips = WhopRuleValidator.extractClipsWithoutAiTokens(
+            project = project,
+            campaign = campaign,
+            desiredClipCount = 3,
+            includeVideoCaptions = true,
+            viralCaptionStyle = "HORMOZI_BOLD"
+        )
+
+        assertEquals(3, generatedClips.size)
+        generatedClips.forEach { clip ->
+            assertTrue(
+                "Expected every viral clip duration to be > 20s (>= 22s), but got ${clip.durationSec}s for ${clip.title}",
+                clip.durationSec > 20L
+            )
+            // Verify multi-timestamp subtitle lines exist for dynamic progression across the clip
+            assertTrue(
+                "Expected multi-timestamp subtitle lines in ${clip.subtitleText}",
+                clip.subtitleText.lines().size >= 3
+            )
+            val phraseStart = GalleryVideoSaver.resolveTimeSyncedSubtitlePhrase(clip, clip.startSec + 1L)
+            val phraseLate = GalleryVideoSaver.resolveTimeSyncedSubtitlePhrase(clip, clip.startSec + 18L)
+            assertTrue(phraseStart.isNotBlank())
+            assertTrue(phraseLate.isNotBlank())
+        }
+
+        // Also verify GalleryVideoSaver enforces >20s duration on exported MP4
+        val firstClip = generatedClips.first()
+        val ext = firstClip.extendedConfig ?: AutoFramingEngine.generateDefaultExtendedConfig(firstClip, project, campaign)
+        val saveRes = GalleryVideoSaver.saveClipToAndroidGallery(
+            context = context,
+            clip = firstClip,
+            extendedConfig = ext,
+            campaign = campaign
+        )
+        assertTrue("Expected GallerySaveResult.Success but got $saveRes", saveRes is GallerySaveResult.Success)
+        val success = saveRes as GallerySaveResult.Success
+        assertTrue("Expected saved MP4 duration > 20s, got ${success.durationSec}s", success.durationSec > 20L)
+    }
 }

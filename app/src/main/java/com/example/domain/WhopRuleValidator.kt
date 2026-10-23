@@ -6,24 +6,30 @@ import com.example.data.model.ClipCandidate
 import com.example.data.model.VideoProject
 import com.example.data.model.WhopCampaign
 import java.io.File
+import java.util.Locale
+import kotlin.math.max
 
 object WhopRuleValidator {
+
+    const val MIN_VIRAL_CLIP_DURATION_SEC = 22L // Every clip must be > 20 seconds
 
     fun validateClip(clip: ClipCandidate, campaign: WhopCampaign): CampaignValidationReport {
         val checks = mutableListOf<CampaignValidationCheck>()
         val ext = clip.extendedConfig
 
-        // 1. Duration Bounds Check
+        // 1. Duration Bounds Check (Also enforces > 20s viral clipping standard)
         val duration = clip.durationSec
-        val durationOk = duration in campaign.minDurationSec..campaign.maxDurationSec
+        val effectiveMin = max(campaign.minDurationSec, 21L)
+        val effectiveMax = max(campaign.maxDurationSec, effectiveMin + 10L)
+        val durationOk = duration in effectiveMin..effectiveMax
         checks.add(
             CampaignValidationCheck(
-                ruleName = "Duration Window (${campaign.minDurationSec}s–${campaign.maxDurationSec}s)",
+                ruleName = "Duration Window (${effectiveMin}s–${effectiveMax}s • >20s Viral Rule)",
                 passed = durationOk,
                 detail = if (durationOk) {
-                    "Clip duration ${duration}s is within campaign bounds."
+                    "Clip duration ${duration}s is >20s and within campaign bounds."
                 } else {
-                    "Clip is ${duration}s; must be between ${campaign.minDurationSec}s and ${campaign.maxDurationSec}s."
+                    "Clip is ${duration}s; must be >20s (between ${effectiveMin}s and ${effectiveMax}s)."
                 },
                 isBlockingConflict = !durationOk
             )
@@ -194,8 +200,10 @@ object WhopRuleValidator {
     }
 
     fun autoFixClipForCampaign(clip: ClipCandidate, campaign: WhopCampaign): ClipCandidate {
-        val targetDuration = clip.durationSec.coerceIn(campaign.minDurationSec, campaign.maxDurationSec)
-        val adjustedEnd = (clip.startSec + targetDuration).coerceAtLeast(clip.startSec + campaign.minDurationSec)
+        val effectiveMin = max(campaign.minDurationSec, MIN_VIRAL_CLIP_DURATION_SEC)
+        val effectiveMax = max(campaign.maxDurationSec, effectiveMin + 10L)
+        val targetDuration = clip.durationSec.coerceIn(effectiveMin, effectiveMax)
+        val adjustedEnd = (clip.startSec + targetDuration).coerceAtLeast(clip.startSec + effectiveMin)
 
         val requiredTags = campaign.requiredHashtags
             .split(" ", ",")
@@ -277,7 +285,8 @@ object WhopRuleValidator {
     }
 
     /**
-     * Formats burned-in video captions into cool viral typography presets.
+     * Formats burned-in video captions into multi-timestamp kinetic viral typography presets
+     * that span the >20s clip duration.
      */
     fun formatViralVideoCaption(
         styleId: String,
@@ -285,16 +294,21 @@ object WhopRuleValidator {
         currentSubtitle: String
     ): String {
         val cleanCore = currentSubtitle
-            .replace(Regex("\\[\\d{2}:\\d{2}\\]\\s*"), "")
+            .replace(Regex("\\[\\d{1,2}:\\d{2}\\]\\s*"), "")
             .replace(Regex("^(STOP SCROLLING:|WAIT FOR IT\\.\\.\\.|NOBODY EXPECTED THIS:|WATCH CLOSELY:)\\s*", RegexOption.IGNORE_CASE), "")
             .trim()
             .ifBlank { title.trim() }
 
+        val cleanTitle = title.trim().ifBlank { "VIRAL MOMENT" }
         return when (styleId) {
-            "GAMING_HYPE" -> "[00:00] WAIT FOR IT... ${cleanCore.uppercase()}!! [00:04] CHAT WENT CRAZY"
-            "STORYTELLER" -> "[00:00] Nobody expected this... [00:03] $cleanCore"
-            "CLEAN_MINIMAL" -> "[00:00] $cleanCore"
-            else -> "[00:00] STOP SCROLLING: ${cleanCore.uppercase()}"
+            "GAMING_HYPE" ->
+                "[00:00] WAIT FOR IT... ${cleanTitle.uppercase(Locale.US)}!!\n[00:07] ${cleanCore.uppercase(Locale.US)}\n[00:14] NOBODY SAW THIS COMING\n[00:21] CHAT WENT CRAZY!!"
+            "STORYTELLER" ->
+                "[00:00] Nobody expected this...\n[00:07] $cleanCore\n[00:14] Watch what happens next in $cleanTitle\n[00:21] Wait for the payoff"
+            "CLEAN_MINIMAL" ->
+                "[00:00] $cleanTitle\n[00:08] $cleanCore\n[00:16] Full viral highlight & reaction"
+            else ->
+                "[00:00] STOP SCROLLING: ${cleanTitle.uppercase(Locale.US)}\n[00:07] ${cleanCore.uppercase(Locale.US)}\n[00:15] THIS CHANGED EVERYTHING\n[00:21] UNBELIEVABLE PAYOFF"
         }.take(950)
     }
 
@@ -319,8 +333,10 @@ object WhopRuleValidator {
     }
 
     /**
-     * Deterministic Zero-Token Local Rule Clipper.
-     * Supports 1 to 10 clips, video captions ON/OFF toggle, and viral caption presets.
+     * Deterministic Viral Moment Scorer & Zero-Token Local Clipper.
+     * - Scores timecoded lines & YouTube heatmap peaks by viral signal density (reactions, exclamations,
+     *   funny banter, high-intensity keywords) so it clips the most viral moments of the video.
+     * - Enforces that EVERY clip is strictly > 20 seconds (25s to 45s).
      */
     fun extractClipsWithoutAiTokens(
         project: VideoProject,
@@ -330,10 +346,11 @@ object WhopRuleValidator {
         viralCaptionStyle: String = "HORMOZI_BOLD"
     ): List<ClipCandidate> {
         val count = desiredClipCount.coerceIn(1, 10)
-        val totalDur = project.durationSec.coerceAtLeast(30L)
-        val minLen = campaign?.minDurationSec ?: 15L
-        val maxLen = campaign?.maxDurationSec ?: 55L
-        val targetLen = ((minLen + maxLen) / 2L).coerceIn(15L, 45L)
+        val totalDur = project.durationSec.coerceAtLeast(90L)
+        // Enforce > 20 seconds (minimum 22s, default 28s-36s)
+        val minLen = max(campaign?.minDurationSec ?: 25L, MIN_VIRAL_CLIP_DURATION_SEC)
+        val maxLen = max(campaign?.maxDurationSec ?: 55L, minLen + 10L)
+        val targetLen = ((minLen + maxLen) / 2L).coerceIn(26L, 45L)
         val aspect = if (campaign?.preferredAspectRatio in listOf("9:16", "16:9", "1:1")) {
             campaign?.preferredAspectRatio ?: "9:16"
         } else {
@@ -351,40 +368,96 @@ object WhopRuleValidator {
                 match.groupValues[3].toLongOrNull() ?: 0L
             }
             val text = match.groupValues[4].trim()
-            sec.coerceIn(0L, (totalDur - 5L).coerceAtLeast(0L)) to text
+            if (text.isBlank()) return@mapNotNull null
+            sec.coerceIn(0L, (totalDur - minLen).coerceAtLeast(0L)) to text
         }
 
+        // Score parsed transcript lines by viral intensity so we pick the highest-potential viral moments
+        val viralKeywords = listOf(
+            "wait", "no way", "bro", "omg", "wtf", "crazy", "insane", "unbelievable",
+            "laugh", "funny", "cooked", "clutch", "goal", "score", "reaction", "shock",
+            "wild", "never", "secret", "million", "win", "lost", "peak", "climax"
+        )
+        val scoredLines = parsedLines.map { (sec, text) ->
+            val lower = text.lowercase(Locale.US)
+            var viralScore = 50
+            viralKeywords.forEach { kw ->
+                if (lower.contains(kw)) viralScore += 14
+            }
+            if (text.contains("!")) viralScore += 12
+            if (text.contains("?")) viralScore += 8
+            if (text.any { it.isUpperCase() }) viralScore += 6
+            Triple(sec, text, viralScore)
+        }.sortedByDescending { it.third }
+
+        // Select non-overlapping high-virality anchors spaced by at least 18 seconds
+        val selectedAnchors = mutableListOf<Pair<Long, String>>()
+        for ((sec, text, _) in scoredLines) {
+            if (selectedAnchors.size >= count) break
+            if (selectedAnchors.none { kotlin.math.abs(it.first - sec) < 18L }) {
+                selectedAnchors.add(sec to text)
+            }
+        }
+
+        val cleanProjectTitle = project.title.ifBlank { "Stream Highlight" }
         val fallbackAnchors = listOf(
-            (totalDur * 0.05).toLong() to "Opening Scroll-Stopper Hook — ${project.title}",
-            (totalDur * 0.14).toLong() to "Early Banter & Unexpected Funny Moment — ${project.title}",
-            (totalDur * 0.24).toLong() to "Rapid Escalation & High-Energy Reaction — ${project.title}",
-            (totalDur * 0.34).toLong() to "Mid-Stream Pattern Interrupt & Callout — ${project.title}",
-            (totalDur * 0.44).toLong() to "Peak Reaction & Chat Hype Spike — ${project.title}",
-            (totalDur * 0.54).toLong() to "High-Stakes Clutch Play Sequence — ${project.title}",
-            (totalDur * 0.64).toLong() to "Unfiltered Creator Takeaway & Debate Hook — ${project.title}",
-            (totalDur * 0.74).toLong() to "Overtime Climax & Crowd Eruption — ${project.title}",
-            (totalDur * 0.83).toLong() to "Shocking Twist & Replay Moment — ${project.title}",
-            (totalDur * 0.90).toLong() to "Final Memorable Mic-Drop & Outro Hook — ${project.title}"
+            (totalDur * 0.12).toLong() to "$cleanProjectTitle — Opening Viral Hook & Immediate Reaction",
+            (totalDur * 0.28).toLong() to "$cleanProjectTitle — Unexpected Funny Banter & Streamer Reaction",
+            (totalDur * 0.45).toLong() to "$cleanProjectTitle — Peak Viral Moment & High-Energy Climax",
+            (totalDur * 0.62).toLong() to "$cleanProjectTitle — Most Replayed Sequence & Crowd Reaction",
+            (totalDur * 0.76).toLong() to "$cleanProjectTitle — Shocking Twist & Unfiltered Commentary",
+            (totalDur * 0.18).toLong() to "$cleanProjectTitle — Viral Callout & Instant Payoff",
+            (totalDur * 0.36).toLong() to "$cleanProjectTitle — Hilarious Moment That Broke The Room",
+            (totalDur * 0.54).toLong() to "$cleanProjectTitle — High-Stakes Showdown & Reaction",
+            (totalDur * 0.70).toLong() to "$cleanProjectTitle — Quotable Hot Take & Viral Debate",
+            (totalDur * 0.84).toLong() to "$cleanProjectTitle — Final Mic-Drop & Closing Payoff"
         )
 
-        val anchorSegments = (parsedLines + fallbackAnchors).take(count)
+        for (fb in fallbackAnchors) {
+            if (selectedAnchors.size >= count) break
+            if (selectedAnchors.none { kotlin.math.abs(it.first - fb.first) < 15L }) {
+                selectedAnchors.add(fb)
+            }
+        }
+
+        val anchorSegments = selectedAnchors.take(count).sortedBy { it.first }
 
         return anchorSegments.mapIndexed { idx, (startRaw, lineText) ->
-            val start = startRaw.coerceIn(0L, (totalDur - minLen).coerceAtLeast(0L))
-            val end = (start + targetLen).coerceAtMost(totalDur).coerceAtLeast(start + 1L)
-            val lower = lineText.lowercase()
+            val maxStart = (totalDur - minLen).coerceAtLeast(0L)
+            val start = startRaw.coerceIn(0L, maxStart)
+            val end = (start + targetLen).coerceAtLeast(start + minLen)
+            val lower = lineText.lowercase(Locale.US)
             val category = when {
-                lower.contains("funny") || lower.contains("laugh") || lower.contains("cooked") -> "FUNNY_MOMENT"
-                lower.contains("clutch") || lower.contains("1v") || lower.contains("overtime") -> "CLUTCH_PLAY"
+                lower.contains("funny") || lower.contains("laugh") || lower.contains("cooked") || lower.contains("banter") -> "FUNNY_MOMENT"
+                lower.contains("clutch") || lower.contains("1v") || lower.contains("overtime") || lower.contains("goal") -> "CLUTCH_PLAY"
                 lower.contains("wait") || lower.contains("what") || lower.contains("reaction") || lineText.contains("!") -> "REACTION"
-                lower.contains("quote") || lower.contains("viewers") || lower.contains("dialogue") || lower.contains("takeaway") -> "MEMORABLE_DIALOGUE"
-                else -> "GAMING_HIGHLIGHT"
+                lower.contains("quote") || lower.contains("viewers") || lower.contains("dialogue") || lower.contains("take") -> "MEMORABLE_DIALOGUE"
+                else -> "EXCITING_MOMENT"
             }
-            val cleanHook = lineText.take(65).removeSuffix(".")
+            val cleanHook = lineText
+                .replace(Regex("^(Host|Player 1|Caster|Streamer|Guest)\\s*(\\([^)]*\\))?:\\s*", RegexOption.IGNORE_CASE), "")
+                .take(68)
+                .removeSuffix(".")
+                .trim()
+                .ifBlank { "${cleanProjectTitle.take(44)} — Viral Moment #${idx + 1}" }
+
+            // Gather nearby transcript lines within [start .. end] so subtitles progress across the >20s clip
+            val nearbyLines = parsedLines
+                .filter { it.first in start..(end + 10L) }
+                .map { it.second }
+                .distinct()
+                .take(4)
+
+            val multiLineContext = if (nearbyLines.size >= 2) {
+                nearbyLines.joinToString(" • ")
+            } else {
+                lineText
+            }
+
             val styledVideoCaption = formatViralVideoCaption(
                 styleId = viralCaptionStyle,
                 title = cleanHook,
-                currentSubtitle = lineText
+                currentSubtitle = multiLineContext
             )
             val styledPostCaption = formatViralPostCaption(
                 styleId = viralCaptionStyle,
@@ -395,20 +468,20 @@ object WhopRuleValidator {
             val baseClip = ClipCandidate(
                 projectId = project.id,
                 campaignId = campaign?.id.orEmpty(),
-                title = cleanHook.ifBlank { "Viral Highlight #${idx + 1} — ${project.title.take(40)}" },
+                title = cleanHook,
                 category = category,
-                reasonForSelection = "High-retention hook extracted at ${start}s–${end}s with ${viralCaptionStyle.replace("_", " ")} viral captions.",
-                confidenceScore = (campaign?.minConfidenceScore ?: 80L).coerceAtLeast(94L - idx * 2L),
+                reasonForSelection = "High-virality moment (${end - start}s) selected at ${start}s–${end}s based on peak reaction intensity and scroll-stopping hook.",
+                confidenceScore = (campaign?.minConfidenceScore ?: 82L).coerceAtLeast(95L - idx * 2L),
                 startSec = start,
                 endSec = end,
                 aspectRatio = aspect,
                 reframeFocusX = listOf(50L, 44L, 56L, 48L, 52L)[idx % 5],
                 subtitlesEnabled = includeVideoCaptions,
-                subtitleText = styledVideoCaption.take(240),
+                subtitleText = styledVideoCaption.take(500),
                 captionText = styledPostCaption.take(350),
                 hashtags = hashtags,
-                seoTitle = "${project.title.take(45)} | Viral Highlight #${idx + 1}",
-                seoKeywords = "${campaign?.brandName ?: "creator"}, viral clip, ${category.lowercase()}, shorts, reels",
+                seoTitle = "${cleanProjectTitle.take(45)} | Viral Highlight #${idx + 1}",
+                seoKeywords = "${campaign?.brandName ?: "creator"}, ${cleanProjectTitle.take(30)}, viral clip, shorts, reels",
                 logoPlacement = campaign?.logoPlacement ?: "TOP_RIGHT",
                 reviewStatus = "PROPOSED"
             )

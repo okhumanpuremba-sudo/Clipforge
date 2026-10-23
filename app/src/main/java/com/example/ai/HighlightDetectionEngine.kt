@@ -12,6 +12,7 @@ import com.google.firebase.ai.type.content
 import com.google.firebase.ai.type.generationConfig
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.cancellation.CancellationException
+import kotlin.math.max
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
@@ -40,12 +41,16 @@ data class ProviderTestOutcome(
 
 class HighlightDetectionEngine {
 
+    companion object {
+        const val MIN_VIRAL_CLIP_DURATION_SEC = 22L // Strictly > 20 seconds
+    }
+
     private val clipListSchema = Schema.obj(
         properties = mapOf(
             "clips" to Schema.array(
                 items = Schema.obj(
                     properties = mapOf(
-                        "title" to Schema.string(description = "Punchy viral hook title under 70 chars"),
+                        "title" to Schema.string(description = "Punchy viral hook title specific to this video under 70 chars"),
                         "category" to Schema.enumeration(
                             values = listOf(
                                 "FUNNY_MOMENT",
@@ -58,18 +63,18 @@ class HighlightDetectionEngine {
                             description = "Highlight moment classification"
                         ),
                         "reasonForSelection" to Schema.string(description = "Concise 1-sentence viral mechanism & retention reason under 140 chars"),
-                        "confidenceScore" to Schema.integer(description = "Confidence score from 65 to 99"),
+                        "confidenceScore" to Schema.integer(description = "Confidence score from 75 to 99"),
                         "startSec" to Schema.integer(description = "Clip start timestamp in seconds"),
-                        "endSec" to Schema.integer(description = "Clip end timestamp in seconds"),
+                        "endSec" to Schema.integer(description = "Clip end timestamp in seconds (endSec - startSec MUST be >= 22 seconds)"),
                         "reframeFocusX" to Schema.integer(description = "Suggested 9:16 horizontal crop focus percentage from 0 to 100"),
-                        "subtitleText" to Schema.string(description = "Punchy burned-in subtitle transcript for this segment under 160 chars"),
+                        "subtitleText" to Schema.string(description = "Multi-line timecoded viral subtitles across the >20s clip, e.g. [00:00] Hook [00:06] Build up [00:14] Climax [00:21] Payoff"),
                         "captionText" to Schema.string(description = "Social media post caption with hook and CTA under 140 chars"),
                         "hashtags" to Schema.string(description = "Space-separated hashtags starting with #"),
                         "seoTitle" to Schema.string(description = "Search-optimized title under 80 chars"),
                         "seoKeywords" to Schema.string(description = "Comma-separated SEO keywords")
                     )
                 ),
-                description = "List of 1 to 10 detected timestamped viral highlight clips"
+                description = "List of 1 to 10 detected timestamped viral highlight clips (each > 20 seconds)"
             )
         )
     )
@@ -123,7 +128,8 @@ class HighlightDetectionEngine {
 
     /**
      * Runs the AI highlight detection pipeline with streaming response collection,
-     * selectable clip count (1–10), video captions ON/OFF toggle, viral caption style presets,
+     * selectable clip count (1–10), enforced >20s clip duration (22s–55s),
+     * video captions ON/OFF toggle, viral caption style presets,
      * bounded 35s–45s per-attempt timeouts, and automatic failover to gemini-3.5-flash-lite.
      */
     suspend fun detectHighlights(
@@ -163,13 +169,12 @@ class HighlightDetectionEngine {
             val activeModelName = if (useBackup) "gemini-3.5-flash-lite" else "gemini-3.8-flash"
             val activeProviderId = if (useBackup) "firebase_ai_backup_lite" else "firebase_ai_primary"
             val timeoutMs = if (useBackup) 45_000L else 35_000L
-            // Only attach the thumbnail on attempt 0 when not in economy token mode
             val includeFrameOnThisAttempt = (attempt == 0 && compactFrame != null && !economyTokenMode)
 
             onProgressUpdate(
                 if (attempt == 0) {
                     val modeTag = if (economyTokenMode) " [Token-Saver Lite]" else ""
-                    "Generating $targetClipCount clip(s) via $activeModelName$modeTag..."
+                    "Generating $targetClipCount viral clip(s) (>20s each) via $activeModelName$modeTag..."
                 } else {
                     "Retry $attempt/$totalRetries: Failing over to ultra-fast $activeModelName ($targetClipCount clips)..."
                 },
@@ -201,7 +206,7 @@ class HighlightDetectionEngine {
                                 val streamFraction = (builder.length.toFloat() / expectedChars.toFloat()).coerceIn(0.05f, 0.95f)
                                 val totalProg = (0.48f + streamFraction * 0.40f).coerceIn(0.50f, 0.88f)
                                 onProgressUpdate(
-                                    "Streaming $targetClipCount viral clip(s) from $activeModelName (${builder.length} chars)...",
+                                    "Streaming $targetClipCount viral clip(s) (>20s) from $activeModelName (${builder.length} chars)...",
                                     totalProg
                                 )
                             }
@@ -214,7 +219,7 @@ class HighlightDetectionEngine {
                     throw IllegalStateException("Model $activeModelName returned an empty response.")
                 }
 
-                onProgressUpdate("Parsing & validating $targetClipCount viral clips against campaign rules...", 0.92f)
+                onProgressUpdate("Parsing & validating $targetClipCount viral clips (>20s duration)...", 0.92f)
                 val parsedClips = parseClipsFromJson(
                     jsonString = rawJson,
                     project = project,
@@ -250,7 +255,6 @@ class HighlightDetectionEngine {
                 lastException = e
                 val msg = e.message.orEmpty().lowercase()
                 if (msg.contains("app check") || msg.contains("attestation") || msg.contains("403")) {
-                    // App Check token rejection applies to all Firebase AI models; exit retry loop immediately for instant failover
                     break
                 }
             }
@@ -264,10 +268,6 @@ class HighlightDetectionEngine {
         throw lastException ?: IllegalStateException("AI Highlight Detection failed after $totalRetries retries.")
     }
 
-    /**
-     * Performs a real live verification test against a provider.
-     * Never claims a backup works unless a real network/model round-trip succeeds.
-     */
     suspend fun testProviderConnectivity(
         providerId: String,
         customEndpointUrl: String = ""
@@ -355,7 +355,7 @@ class HighlightDetectionEngine {
         }
     }
 
-    private fun sampleTranscriptWindow(rawTranscript: String, maxChars: Int = 2800): String {
+    private fun sampleTranscriptWindow(rawTranscript: String, maxChars: Int = 3200): String {
         val trimmed = rawTranscript.trim()
         if (trimmed.isEmpty()) return ""
         if (trimmed.length <= maxChars) return trimmed
@@ -384,12 +384,15 @@ class HighlightDetectionEngine {
         economyTokenMode: Boolean = false
     ): String {
         val targetAspect = campaign?.preferredAspectRatio?.ifBlank { "9:16" } ?: "9:16"
+        val effectiveMinDur = max(campaign?.minDurationSec ?: 25L, MIN_VIRAL_CLIP_DURATION_SEC)
+        val effectiveMaxDur = max(campaign?.maxDurationSec ?: 55L, effectiveMinDur + 10L)
+
         val campaignBlock = if (campaign != null) {
             """
             ACTIVE WHOP CAMPAIGN RULES (MUST ENFORCE):
             - Campaign Name: ${campaign.name} (Brand: ${campaign.brandName})
             - Target Platform: ${campaign.targetPlatform} (Aspect Ratio: $targetAspect)
-            - Allowed Clip Duration: between ${campaign.minDurationSec} seconds and ${campaign.maxDurationSec} seconds
+            - MANDATORY Clip Duration: EVERY clip MUST be MORE THAN 20 SECONDS (between $effectiveMinDur seconds and $effectiveMaxDur seconds, i.e., endSec - startSec >= $effectiveMinDur)
             - Required Logo Placement: ${campaign.logoPlacement} (${campaign.requiredLogoAsset})
             - Required Hashtags: ${campaign.requiredHashtags}
             - Mandatory Caption CTA: "${campaign.mandatoryCaptionCta}"
@@ -397,45 +400,41 @@ class HighlightDetectionEngine {
             - Minimum Confidence Score: ${campaign.minConfidenceScore}
             """.trimIndent()
         } else {
-            "Standard $targetAspect short-form clipping rules: target clip duration 15 to 55 seconds."
+            "Standard $targetAspect short-form clipping rules: EVERY clip MUST be MORE THAN 20 SECONDS (between 24 and 48 seconds)."
         }
 
         val captionStyleInstruction = when (viralCaptionStyle) {
-            "GAMING_HYPE" -> "GAMING HYPE style: high-adrenaline, ALL-CAPS power words, clutch callouts (e.g. '[00:00] WAIT FOR THIS 1V4 CLUTCH!! [00:04] CHAT WENT CRAZY')"
-            "STORYTELLER" -> "STORYTELLER HOOK style: curiosity-gap narrative hook (e.g. '[00:00] Nobody believed this would work... [00:04] Until THIS happened')"
-            "CLEAN_MINIMAL" -> "CLEAN MINIMAL style: crisp, punchy creator subtitles with clean punctuation"
-            else -> "HORMOZI BOLD style: ultra-punchy 3-5 word kinetic lines with ALL-CAPS emphasis words (e.g. '[00:00] THIS 1 MISTAKE [00:03] COST EVERYTHING')"
+            "GAMING_HYPE" -> "GAMING HYPE style: high-adrenaline multi-timestamp lines across the >20s clip (e.g. '[00:00] WAIT FOR THIS MOMENT!! [00:06] NOBODY SAW THIS COMING [00:13] UNREAL REACTION [00:20] CHAT WENT CRAZY')"
+            "STORYTELLER" -> "STORYTELLER HOOK style: curiosity-gap narrative across the >20s clip (e.g. '[00:00] Nobody believed this would happen... [00:07] Watch the reaction closely [00:15] Until THIS moment changed everything [00:22] Legendary payoff')"
+            "CLEAN_MINIMAL" -> "CLEAN MINIMAL style: crisp timecoded creator subtitles every 6 seconds across the clip"
+            else -> "HORMOZI BOLD style: ultra-punchy 4-6 word kinetic timecoded lines across the >20s clip (e.g. '[00:00] STOP SCROLLING RIGHT NOW [00:06] WATCH WHAT HAPPENS NEXT [00:13] THIS CHANGED EVERYTHING [00:20] UNBELIEVABLE PAYOFF')"
         }
 
-        val maxTranscriptChars = if (economyTokenMode) 1600 else 2800
+        val maxTranscriptChars = if (economyTokenMode) 1800 else 3200
         val sampledTranscript = sampleTranscriptWindow(project.transcriptText, maxChars = maxTranscriptChars)
 
         return """
-            You are ClipForge AI, an elite viral short-form video producer and highlight detection pipeline for YouTube Shorts, TikTok, Instagram Reels, and Whop Creator Bounties.
-            Analyze the source video/stream metadata, thumbnail visual cues (if attached), and timecoded transcript/chapters to find EXACTLY $desiredClipCount clip(s) with the highest probability of going VIRAL. Return exactly $desiredClipCount item(s) in the `clips` array. Keep every string field concise and punchy.
+            You are ClipForge AI, an elite viral short-form video producer for YouTube Shorts, TikTok, Instagram Reels, and Whop Creator Bounties.
+            Analyze the source video metadata, creator/channel, thumbnail visual cues, heatmap peaks, and timecoded transcript/chapters to find EXACTLY $desiredClipCount clip(s) with the highest probability of going VIRAL.
 
-            VIRAL CLIP SELECTION & CAPTION CRITERIA:
-            1. 2-Second Scroll-Stopper Hook: Starts immediately on a pattern interrupt, bold claim, high-stakes moment, or visceral reaction.
-            2. High Emotional or Comedy Payoff: Clear escalation and payoff within 15–55 seconds.
-            3. Cool Viral Video Captions (`subtitleText` & `captionText`):
+            CRITICAL VIRAL CLIPPING REQUIREMENTS:
+            1. DURATION > 20 SECONDS (MANDATORY): Every single clip MUST have `endSec - startSec >= $effectiveMinDur` (strictly more than 20 seconds, ideally 25 to 45 seconds). Never output a clip shorter than 22 seconds.
+            2. TRUE VIRAL MOMENT SELECTION: Pick the exact timestamp windows where the video has the strongest viral potential (2-second scroll-stopper hook, peak reaction, hilarious interaction, shocking twist, or most-replayed climax). Base all titles, subtitles, and captions strictly on '${project.title}' and its actual transcript/creators — NEVER invent unrelated topics.
+            3. MULTI-TIMESTAMP SUBTITLES (`subtitleText`):
                - Burned-in Video Captions Mode: ${if (includeVideoCaptions) "ENABLED" else "DISABLED (still provide backup caption text)"}
                - Style Preset: $captionStyleInstruction
-               - Make `captionText` an irresistible viral social post caption with a curiosity hook and CTA.
-               - Make `seoTitle` and `seoKeywords` high-converting search metadata for Shorts/TikTok/Reels discovery.
+               - Include 4 to 5 timecoded lines (`[00:00] ... [00:06] ... [00:13] ... [00:20] ...`) that progress through the >20s viral moment.
             4. Classify each clip into one of: FUNNY_MOMENT, REACTION, GAMING_HIGHLIGHT, CLUTCH_PLAY, EXCITING_MOMENT, MEMORABLE_DIALOGUE.
-            5. In `reasonForSelection`, concisely state the VIRAL MECHANISM (hook + retention driver) in 1 sentence under 140 chars.
 
             SOURCE VIDEO / STREAM METADATA:
             - Project Title: ${project.title}
             - Source Info: ${project.sourceFileName}
-            - Source Link / URI: ${project.sourceUri.ifBlank { "Local / Studio Project" }}
-            - Total Duration: ${project.durationSec} seconds (All clip startSec and endSec MUST be within 0..${project.durationSec})
-            - Source Resolution: ${project.width}x${project.height}
+            - Total Duration: ${project.durationSec} seconds (All clip startSec and endSec MUST be within 0..${project.durationSec} and endSec - startSec >= $effectiveMinDur)
 
             $campaignBlock
 
             SOURCE TRANSCRIPT / CAPTIONS / STREAM CHAPTERS:
-            ${sampledTranscript.ifBlank { "No transcript provided; infer realistic high-virality timestamped segments within 0..${project.durationSec}s based on '${project.title}'." }}
+            ${sampledTranscript.ifBlank { "Infer high-virality timestamped segments (>22s each) within 0..${project.durationSec}s specifically tailored to '${project.title}'." }}
         """.trimIndent()
     }
 
@@ -450,9 +449,10 @@ class HighlightDetectionEngine {
         val root = JSONObject(jsonString)
         val array = root.getJSONArray("clips")
         val results = mutableListOf<ClipCandidate>()
-        val maxDur = project.durationSec.coerceAtLeast(30L)
-        val minClipLen = campaign?.minDurationSec ?: 15L
-        val maxClipLen = campaign?.maxDurationSec ?: 60L
+        val maxDur = project.durationSec.coerceAtLeast(60L)
+        // Strictly enforce > 20 seconds (minimum 22s, default 25s)
+        val minClipLen = max(campaign?.minDurationSec ?: 25L, MIN_VIRAL_CLIP_DURATION_SEC)
+        val maxClipLen = max(campaign?.maxDurationSec ?: 55L, minClipLen + 10L)
         val validAspect = if (campaign?.preferredAspectRatio in listOf("9:16", "16:9", "1:1")) {
             campaign?.preferredAspectRatio ?: "9:16"
         } else {
@@ -462,25 +462,27 @@ class HighlightDetectionEngine {
         val limit = array.length().coerceAtMost(desiredClipCount.coerceIn(1, 10))
         for (i in 0 until limit) {
             val item = array.getJSONObject(i)
-            val rawStart = item.optLong("startSec", (i * 22L).coerceAtMost(maxDur - 15L)).coerceIn(0L, maxDur - 5L)
-            val rawEnd = item.optLong("endSec", rawStart + minClipLen)
+            val maxAllowedStart = (maxDur - minClipLen).coerceAtLeast(0L)
+            val rawStart = item.optLong("startSec", (i * 28L).coerceAtMost(maxAllowedStart))
+                .coerceIn(0L, maxAllowedStart)
+            val rawEnd = item.optLong("endSec", rawStart + 28L)
             val boundedDuration = (rawEnd - rawStart).coerceIn(minClipLen, maxClipLen)
-            val finalEnd = (rawStart + boundedDuration).coerceAtMost(maxDur).coerceAtLeast(rawStart + 1L)
+            val finalEnd = (rawStart + boundedDuration).coerceAtLeast(rawStart + minClipLen)
 
-            val rawCategory = item.optString("category", "GAMING_HIGHLIGHT")
+            val rawCategory = item.optString("category", "EXCITING_MOMENT")
             val validCategory = if (rawCategory in setOf(
                     "FUNNY_MOMENT", "REACTION", "GAMING_HIGHLIGHT",
                     "CLUTCH_PLAY", "EXCITING_MOMENT", "MEMORABLE_DIALOGUE"
                 )
-            ) rawCategory else "GAMING_HIGHLIGHT"
+            ) rawCategory else "EXCITING_MOMENT"
 
-            val rawTitle = item.optString("title", "Viral Highlight #${i + 1}").take(150)
+            val rawTitle = item.optString("title", "${project.title.take(48)} — Viral Clip #${i + 1}").take(150)
             val rawSubtitle = item.optString("subtitleText", "").ifBlank {
                 when (viralCaptionStyle) {
-                    "GAMING_HYPE" -> "[00:00] WAIT FOR IT... ${rawTitle.uppercase()}!! [00:04] UNREAL MOMENT"
-                    "STORYTELLER" -> "[00:00] Watch closely... [00:03] $rawTitle"
-                    "CLEAN_MINIMAL" -> "[00:00] $rawTitle"
-                    else -> "[00:00] STOP SCROLLING: ${rawTitle.uppercase()}"
+                    "GAMING_HYPE" -> "[00:00] WAIT FOR IT... ${rawTitle.uppercase()}!! [00:07] WATCH THIS REACTION [00:14] NOBODY EXPECTED THIS [00:21] UNREAL PAYOFF"
+                    "STORYTELLER" -> "[00:00] Watch closely... [00:07] $rawTitle [00:14] Everything changed right here [00:21] Wait for the ending"
+                    "CLEAN_MINIMAL" -> "[00:00] $rawTitle [00:08] Peak viral moment [00:16] Full reaction & payoff"
+                    else -> "[00:00] STOP SCROLLING: ${rawTitle.uppercase()} [00:07] WATCH WHAT HAPPENS NEXT [00:15] UNBELIEVABLE MOMENT [00:21] FULL REACTION"
                 }
             }
 
@@ -490,8 +492,8 @@ class HighlightDetectionEngine {
                     campaignId = campaign?.id.orEmpty(),
                     title = rawTitle,
                     category = validCategory,
-                    reasonForSelection = item.optString("reasonForSelection", "High vocal and visual engagement peak.").take(600),
-                    confidenceScore = item.optLong("confidenceScore", 88L).coerceIn(0L, 100L),
+                    reasonForSelection = item.optString("reasonForSelection", "High-retention viral moment (${finalEnd - rawStart}s) with strong opening hook and payoff.").take(600),
+                    confidenceScore = item.optLong("confidenceScore", 91L).coerceIn(0L, 100L),
                     startSec = rawStart,
                     endSec = finalEnd,
                     aspectRatio = validAspect,

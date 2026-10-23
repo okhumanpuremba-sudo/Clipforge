@@ -11,6 +11,7 @@ import android.net.Uri
 import android.provider.OpenableColumns
 import com.example.data.model.ClipCandidate
 import com.example.data.model.WhopCampaign
+import com.example.util.GalleryVideoSaver
 import java.io.File
 import java.nio.ByteBuffer
 import kotlinx.coroutines.Dispatchers
@@ -46,9 +47,9 @@ sealed interface ClipExportResult {
 
 /**
  * Clean architectural boundary separating:
- * 1. WORKING on-device Android MediaMetadataRetriever + MediaMuxer stream cutting.
+ * 1. WORKING on-device Android MediaMetadataRetriever + MediaMuxer stream cutting (supports content:// and downloaded local MP4 files).
  * 2. WORKING SRT subtitle & JSON edit decision list (EDL) export.
- * 3. PLUGGABLE BACKEND CONTRACT (FFmpeg filtergraph spec) for future cloud GPU worker connection.
+ * 3. PLUGGABLE BACKEND CONTRACT (FFmpeg filtergraph spec) for Termux & cloud GPU worker connection.
  */
 object VideoProcessingPipeline {
 
@@ -71,15 +72,15 @@ object VideoProcessingPipeline {
                     ?.toLongOrNull() ?: 1920L
                 val height = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
                     ?.toLongOrNull() ?: 1080L
-                val durationSec = (durationMs / 1000L).coerceAtLeast(1L)
+                val durationSec = (durationMs / 1000L).coerceAtLeast(25L)
 
                 val frames = mutableListOf<Bitmap>()
-                val samplePoints = listOf(0.15, 0.50, 0.85)
+                val samplePoints = listOf(0.12, 0.30, 0.50, 0.70, 0.88)
                 for (pct in samplePoints) {
                     val timeUs = (durationMs * pct * 1000).toLong()
                     val frame = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                     if (frame != null) {
-                        val scaled = Bitmap.createScaledBitmap(frame, 320, 180, true)
+                        val scaled = Bitmap.createScaledBitmap(frame, 640, 360, true)
                         frames.add(scaled)
                     }
                 }
@@ -112,15 +113,35 @@ object VideoProcessingPipeline {
         uriString: String,
         timestampSec: Long
     ): Bitmap? = withContext(Dispatchers.IO) {
-        if (uriString.isBlank() || !uriString.startsWith("content://")) return@withContext null
+        if (uriString.isBlank()) return@withContext null
         val retriever = MediaMetadataRetriever()
         try {
-            retriever.setDataSource(context, Uri.parse(uriString))
+            when {
+                uriString.startsWith("content://") -> {
+                    retriever.setDataSource(context, Uri.parse(uriString))
+                }
+                uriString.startsWith("file://") -> {
+                    val path = Uri.parse(uriString).path.orEmpty()
+                    if (path.isNotBlank() && File(path).exists()) {
+                        retriever.setDataSource(path)
+                    } else {
+                        return@withContext null
+                    }
+                }
+                else -> {
+                    val file = File(uriString)
+                    if (file.exists() && file.length() > 1024L) {
+                        retriever.setDataSource(file.absolutePath)
+                    } else {
+                        return@withContext null
+                    }
+                }
+            }
             val frame = retriever.getFrameAtTime(
                 timestampSec * 1_000_000L,
                 MediaMetadataRetriever.OPTION_CLOSEST_SYNC
             )
-            frame?.let { Bitmap.createScaledBitmap(it, 540, 304, true) }
+            frame?.let { Bitmap.createScaledBitmap(it, 640, 360, true) }
         } catch (_: Exception) {
             null
         } finally {
@@ -156,15 +177,16 @@ object VideoProcessingPipeline {
     }
 
     fun buildSrtContent(clip: ClipCandidate): String {
-        val duration = clip.durationSec.coerceAtLeast(2L)
+        val duration = clip.durationSec.coerceAtLeast(GalleryVideoSaver.MIN_VIRAL_CLIP_DURATION_SEC)
         val lines = clip.subtitleText
             .ifBlank { clip.title }
-            .split("\n", ". ", "! ", "? ")
+            .replace(Regex("\\[\\d{1,2}:\\d{2}\\]\\s*"), "\n")
+            .split("\n", ". ", "! ", "? ", " • ")
             .map { it.trim() }
             .filter { it.isNotEmpty() }
             .ifEmpty { listOf(clip.title) }
 
-        val segmentSec = (duration.toDouble() / lines.size).coerceAtLeast(1.0)
+        val segmentSec = (duration.toDouble() / lines.size).coerceAtLeast(1.5)
         return buildString {
             lines.forEachIndexed { idx, line ->
                 val segStart = (idx * segmentSec).toLong()
@@ -185,7 +207,7 @@ object VideoProcessingPipeline {
     }
 
     /**
-     * Executes real on-device MP4 stream trimming / vertical rendering, writes the SRT subtitle file,
+     * Executes real on-device MP4 stream trimming / vertical rendering (>20s duration), writes the SRT subtitle file,
      * and writes the JSON Render Spec with the full dynamic layout timeline, Logo ON/OFF state,
      * and Hook Caption ON/OFF state.
      */
@@ -194,15 +216,18 @@ object VideoProcessingPipeline {
         clip: ClipCandidate,
         campaign: WhopCampaign?,
         sourceUriString: String,
-        sourceFileName: String
+        sourceFileName: String,
+        sourceFrames: List<Bitmap> = emptyList()
     ): ClipExportResult = withContext(Dispatchers.IO) {
         try {
             val exportDir = File(context.cacheDir, "clipforge_exports").apply { mkdirs() }
             val safeId = clip.id.take(8).ifBlank { "clip" }
             val srtFile = File(exportDir, "clipforge_${safeId}.srt")
             val manifestFile = File(exportDir, "clipforge_${safeId}_render_spec.json")
-            val ext = clip.extendedConfig ?: AutoFramingEngine.generateDefaultExtendedConfig(clip, campaign = campaign)
-            val clipWithExt = clip.copy(extendedConfig = ext)
+            val effectiveEndSec = clip.endSec.coerceAtLeast(clip.startSec + GalleryVideoSaver.MIN_VIRAL_CLIP_DURATION_SEC)
+            val normalizedClip = clip.copy(endSec = effectiveEndSec)
+            val ext = normalizedClip.extendedConfig ?: AutoFramingEngine.generateDefaultExtendedConfig(normalizedClip, campaign = campaign)
+            val clipWithExt = normalizedClip.copy(extendedConfig = ext)
             val ffmpegCmd = buildFfmpegWorkerCommand(clipWithExt, campaign, sourceFileName, sourceUriString)
 
             srtFile.writeText(buildSrtContent(clipWithExt))
@@ -228,17 +253,17 @@ object VideoProcessingPipeline {
             val manifestJson = JSONObject().apply {
                 put("schemaVersion", "2.0")
                 put("exportEngine", "ClipForge AI Dynamic Auto-Framing & Termux Pipeline")
-                put("clipId", clip.id)
+                put("clipId", clipWithExt.id)
                 put("sourceUri", sourceUriString)
-                put("title", clip.title)
-                put("category", clip.category)
-                put("confidenceScore", clip.confidenceScore)
-                put("startSec", clip.startSec)
-                put("endSec", clip.endSec)
-                put("durationSec", clip.durationSec)
-                put("aspectRatio", clip.aspectRatio)
-                put("reframeFocusXPercent", clip.reframeFocusX)
-                put("subtitlesEnabled", clip.subtitlesEnabled)
+                put("title", clipWithExt.title)
+                put("category", clipWithExt.category)
+                put("confidenceScore", clipWithExt.confidenceScore)
+                put("startSec", clipWithExt.startSec)
+                put("endSec", clipWithExt.endSec)
+                put("durationSec", clipWithExt.durationSec)
+                put("aspectRatio", clipWithExt.aspectRatio)
+                put("reframeFocusXPercent", clipWithExt.reframeFocusX)
+                put("subtitlesEnabled", clipWithExt.subtitlesEnabled)
                 put("logoEnabled", ext.logoConfig.enabled)
                 put("logoPlacement", if (ext.logoConfig.enabled) ext.logoConfig.position else "NONE")
                 put("logoSizePct", ext.logoConfig.sizePct)
@@ -249,32 +274,38 @@ object VideoProcessingPipeline {
                 put("exportResolution", ext.exportConfig.resolution)
                 put("exportFps", ext.exportConfig.fps)
                 put("dynamicLayoutSegments", segmentsJson)
-                put("captionText", clip.captionText)
-                put("hashtags", JSONArray(clip.hashtags.split(" ").filter { it.isNotBlank() }))
-                put("seoTitle", clip.seoTitle)
-                put("seoKeywords", clip.seoKeywords)
+                put("captionText", clipWithExt.captionText)
+                put("hashtags", JSONArray(clipWithExt.hashtags.split(" ").filter { it.isNotBlank() }))
+                put("seoTitle", clipWithExt.seoTitle)
+                put("seoKeywords", clipWithExt.seoKeywords)
                 put("ffmpegWorkerCommand", ffmpegCmd)
             }
             manifestFile.writeText(manifestJson.toString(2))
 
-            val mp4File = File(exportDir, "clipforge_${safeId}_${clip.startSec}s_${clip.endSec}s.mp4")
+            val mp4File = File(exportDir, "clipforge_${safeId}_${clipWithExt.startSec}s_${clipWithExt.endSec}s.mp4")
             var muxSuccess = false
-            if (sourceUriString.startsWith("content://")) {
+            val isLocalVideoFile = sourceUriString.startsWith("content://") ||
+                sourceUriString.startsWith("file://") ||
+                (sourceUriString.isNotBlank() && File(sourceUriString).exists())
+
+            if (isLocalVideoFile) {
                 muxSuccess = trimLocalMp4WithMediaMuxer(
                     context = context,
-                    sourceUri = Uri.parse(sourceUriString),
+                    sourceUriOrPath = sourceUriString,
                     destFile = mp4File,
-                    startUs = clip.startSec * 1_000_000L,
-                    endUs = clip.endSec * 1_000_000L
+                    startUs = clipWithExt.startSec * 1_000_000L,
+                    endUs = clipWithExt.endSec * 1_000_000L
                 )
             }
 
             if (!muxSuccess || !mp4File.exists() || mp4File.length() == 0L) {
-                val synthesized = com.example.util.GalleryVideoSaver.ensurePlayableClipMp4(
+                val synthesized = GalleryVideoSaver.ensurePlayableClipMp4(
                     context = context,
                     clip = clipWithExt,
                     extendedConfig = ext,
-                    campaign = campaign
+                    campaign = campaign,
+                    sourceFrames = sourceFrames,
+                    sourceVideoUriOrPath = sourceUriString
                 ).getOrNull()
                 if (synthesized != null && synthesized.exists() && synthesized.length() > 0L) {
                     synthesized.copyTo(mp4File, overwrite = true)
@@ -304,7 +335,7 @@ object VideoProcessingPipeline {
 
     private fun trimLocalMp4WithMediaMuxer(
         context: Context,
-        sourceUri: Uri,
+        sourceUriOrPath: String,
         destFile: File,
         startUs: Long,
         endUs: Long
@@ -312,55 +343,72 @@ object VideoProcessingPipeline {
         val extractor = MediaExtractor()
         var muxer: MediaMuxer? = null
         return try {
-            val pfd = context.contentResolver.openFileDescriptor(sourceUri, "r") ?: return false
-            pfd.use { descriptor ->
-                extractor.setDataSource(descriptor.fileDescriptor)
-                val trackCount = extractor.trackCount
-                muxer = MediaMuxer(destFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-                val indexMap = HashMap<Int, Int>()
-                var maxBufferSize = 1024 * 1024
-
-                for (i in 0 until trackCount) {
-                    val format = extractor.getTrackFormat(i)
-                    val mime = format.getString(MediaFormat.KEY_MIME) ?: continue
-                    if (mime.startsWith("video/") || mime.startsWith("audio/")) {
-                        extractor.selectTrack(i)
-                        val dstIndex = muxer!!.addTrack(format)
-                        indexMap[i] = dstIndex
-                        if (format.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) {
-                            val trackMax = format.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE)
-                            if (trackMax > maxBufferSize) maxBufferSize = trackMax
-                        }
+            when {
+                sourceUriOrPath.startsWith("content://") -> {
+                    val pfd = context.contentResolver.openFileDescriptor(Uri.parse(sourceUriOrPath), "r") ?: return false
+                    pfd.use { descriptor ->
+                        extractor.setDataSource(descriptor.fileDescriptor)
                     }
                 }
-
-                if (indexMap.isEmpty()) return false
-                extractor.seekTo(startUs, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
-                muxer!!.start()
-
-                val dstBuf = ByteBuffer.allocate(maxBufferSize)
-                val bufferInfo = MediaCodec.BufferInfo()
-
-                while (true) {
-                    bufferInfo.offset = 0
-                    bufferInfo.size = extractor.readSampleData(dstBuf, 0)
-                    if (bufferInfo.size < 0) break
-                    val sampleTime = extractor.sampleTime
-                    if (sampleTime > endUs) break
-                    if (sampleTime >= startUs) {
-                        bufferInfo.presentationTimeUs = sampleTime - startUs
-                        bufferInfo.flags = extractor.sampleFlags
-                        val trackIndex = extractor.sampleTrackIndex
-                        val dstTrack = indexMap[trackIndex]
-                        if (dstTrack != null) {
-                            muxer!!.writeSampleData(dstTrack, dstBuf, bufferInfo)
-                        }
-                    }
-                    extractor.advance()
+                sourceUriOrPath.startsWith("file://") -> {
+                    val path = Uri.parse(sourceUriOrPath).path ?: return false
+                    if (!File(path).exists()) return false
+                    extractor.setDataSource(path)
                 }
-                muxer!!.stop()
-                true
+                else -> {
+                    val f = File(sourceUriOrPath)
+                    if (!f.exists() || f.length() <= 1024L) return false
+                    extractor.setDataSource(f.absolutePath)
+                }
             }
+
+            val trackCount = extractor.trackCount
+            muxer = MediaMuxer(destFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            val indexMap = HashMap<Int, Int>()
+            var maxBufferSize = 1024 * 1024
+
+            for (i in 0 until trackCount) {
+                val format = extractor.getTrackFormat(i)
+                val mime = format.getString(MediaFormat.KEY_MIME) ?: continue
+                if (mime.startsWith("video/") || mime.startsWith("audio/")) {
+                    extractor.selectTrack(i)
+                    val dstIndex = muxer!!.addTrack(format)
+                    indexMap[i] = dstIndex
+                    if (format.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) {
+                        val trackMax = format.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE)
+                        if (trackMax > maxBufferSize) maxBufferSize = trackMax
+                    }
+                }
+            }
+
+            if (indexMap.isEmpty()) return false
+            extractor.seekTo(startUs, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
+            muxer!!.start()
+
+            val dstBuf = ByteBuffer.allocate(maxBufferSize)
+            val bufferInfo = MediaCodec.BufferInfo()
+            var wroteSamples = 0
+
+            while (true) {
+                bufferInfo.offset = 0
+                bufferInfo.size = extractor.readSampleData(dstBuf, 0)
+                if (bufferInfo.size < 0) break
+                val sampleTime = extractor.sampleTime
+                if (sampleTime > endUs) break
+                if (sampleTime >= startUs) {
+                    bufferInfo.presentationTimeUs = sampleTime - startUs
+                    bufferInfo.flags = extractor.sampleFlags
+                    val trackIndex = extractor.sampleTrackIndex
+                    val dstTrack = indexMap[trackIndex]
+                    if (dstTrack != null) {
+                        muxer!!.writeSampleData(dstTrack, dstBuf, bufferInfo)
+                        wroteSamples++
+                    }
+                }
+                extractor.advance()
+            }
+            muxer!!.stop()
+            wroteSamples > 10 && destFile.exists() && destFile.length() > 1024L
         } catch (_: Exception) {
             false
         } finally {

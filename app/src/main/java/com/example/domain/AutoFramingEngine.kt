@@ -57,7 +57,7 @@ object AutoFramingEngine {
             segments = rawSegments,
             minSegmentDurationSec = hysteresisMinSec,
             clipStartSec = clip.startSec,
-            clipEndSec = clip.endSec
+            clipEndSec = clip.endSec.coerceAtLeast(clip.startSec + 22L)
         )
 
         val campaignRequiresLogo = campaign != null && campaign.logoPlacement != "NONE"
@@ -137,8 +137,8 @@ object AutoFramingEngine {
         transitionMs: Int = 250
     ): List<LayoutSegment> {
         val clipStart = clip.startSec
-        val clipEnd = clip.endSec.coerceAtLeast(clipStart + 3L)
-        val totalDuration = (clipEnd - clipStart).coerceAtLeast(3L)
+        val clipEnd = clip.endSec.coerceAtLeast(clipStart + 22L)
+        val totalDuration = (clipEnd - clipStart).coerceAtLeast(22L)
 
         // Inspect sample frames if available for corner webcam vs center speaker vs dual speaker density
         val frameHint = if (sampleFrames.isNotEmpty()) {

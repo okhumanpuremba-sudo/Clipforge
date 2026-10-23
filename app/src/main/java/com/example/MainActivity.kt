@@ -449,6 +449,7 @@ fun ClipForgeMainShell(
                                     viralCaptionStyle = studioState.viralCaptionStyle,
                                     onSetViralCaptionStyle = viewModel::setViralCaptionStyle,
                                     singlePreviewFrame = studioState.singleClipPreviewFrame ?: fallbackThumb,
+                                    projectPreviewFramesMap = studioState.uploadedPreviewFrames,
                                     lastExportSummary = studioState.lastExportSummary,
                                     lastExportFfmpegCommand = studioState.lastExportFfmpegCommand,
                                     lastExportSrtPreview = studioState.lastExportSrtPreview,

@@ -98,6 +98,7 @@ fun InAppVerticalVideoPlayerCard(
     extendedConfig: ClipExtendedConfig,
     campaign: WhopCampaign?,
     sourcePreviewFrame: Bitmap?,
+    sourcePreviewFrames: List<Bitmap> = emptyList(),
     currentPlayheadSec: Long,
     onPlayheadChanged: (Long) -> Unit
 ) {
@@ -106,8 +107,19 @@ fun InAppVerticalVideoPlayerCard(
     var isFullScreen by rememberSaveable(clip.id) { mutableStateOf(false) }
 
     val startSec = clip.startSec
-    val endSec = clip.endSec.coerceAtLeast(startSec + 1L)
+    val endSec = clip.endSec.coerceAtLeast(startSec + 22L)
     val activeSegment = AutoFramingEngine.segmentAtTimestamp(extendedConfig.segments, currentPlayheadSec)
+
+    val activeFrameForPlayhead = remember(sourcePreviewFrames, sourcePreviewFrame, currentPlayheadSec, startSec, endSec) {
+        if (sourcePreviewFrames.size > 1) {
+            val span = (endSec - startSec).coerceAtLeast(1L).toFloat()
+            val norm = ((currentPlayheadSec - startSec).coerceAtLeast(0L).toFloat() / span).coerceIn(0f, 0.999f)
+            val idx = (norm * sourcePreviewFrames.size).toInt().coerceIn(0, sourcePreviewFrames.lastIndex)
+            sourcePreviewFrames[idx]
+        } else {
+            sourcePreviewFrames.firstOrNull() ?: sourcePreviewFrame
+        }
+    }
 
     // Advance playhead automatically while playing
     LaunchedEffect(isPlaying, currentPlayheadSec, startSec, endSec) {
@@ -130,13 +142,13 @@ fun InAppVerticalVideoPlayerCard(
         clip.subtitleText,
         extendedConfig,
         currentPlayheadSec,
-        sourcePreviewFrame
+        activeFrameForPlayhead
     ) {
         GalleryVideoSaver.renderCompositeVerticalFrameBitmap(
             clip = clip,
             extendedConfig = extendedConfig,
             campaign = campaign,
-            sourceFrame = sourcePreviewFrame,
+            sourceFrame = activeFrameForPlayhead,
             timestampSec = currentPlayheadSec,
             outWidth = 480,
             outHeight = 854

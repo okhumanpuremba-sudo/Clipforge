@@ -109,6 +109,7 @@ fun ClipReviewStudioScreen(
     viralCaptionStyle: String = "HORMOZI_BOLD",
     onSetViralCaptionStyle: (String) -> Unit = {},
     singlePreviewFrame: Bitmap?,
+    projectPreviewFramesMap: Map<String, List<Bitmap>> = emptyMap(),
     lastExportSummary: String?,
     lastExportFfmpegCommand: String?,
     lastExportSrtPreview: String?,
@@ -150,7 +151,11 @@ fun ClipReviewStudioScreen(
 
     var editTitle by remember(activeClip?.id) { mutableStateOf(activeClip?.title.orEmpty()) }
     var editStartSec by remember(activeClip?.id) { mutableFloatStateOf((activeClip?.startSec ?: 0L).toFloat()) }
-    var editEndSec by remember(activeClip?.id) { mutableFloatStateOf((activeClip?.endSec ?: 30L).toFloat()) }
+    var editEndSec by remember(activeClip?.id) {
+        val rawStart = activeClip?.startSec ?: 0L
+        val rawEnd = (activeClip?.endSec ?: 28L).coerceAtLeast(rawStart + 22L)
+        mutableFloatStateOf(rawEnd.toFloat())
+    }
     var editReframeX by remember(activeClip?.id) { mutableFloatStateOf((activeClip?.reframeFocusX ?: 50L).toFloat()) }
     var editSubtitlesOn by remember(activeClip?.id) { mutableStateOf(activeClip?.subtitlesEnabled ?: true) }
     var editSubtitleText by remember(activeClip?.id) { mutableStateOf(activeClip?.subtitleText.orEmpty()) }
@@ -176,7 +181,7 @@ fun ClipReviewStudioScreen(
         if (activeClip != null) {
             editTitle = activeClip.title
             editStartSec = activeClip.startSec.toFloat()
-            editEndSec = activeClip.endSec.toFloat()
+            editEndSec = activeClip.endSec.coerceAtLeast(activeClip.startSec + 22L).toFloat()
             editReframeX = activeClip.reframeFocusX.toFloat()
             editSubtitlesOn = activeClip.subtitlesEnabled
             editSubtitleText = activeClip.subtitleText
@@ -327,10 +332,14 @@ fun ClipReviewStudioScreen(
                     campaign = activeCampaign
                 )
 
+            val activeProjectFrames = projectPreviewFramesMap[activeClip.projectId].orEmpty()
+                .ifEmpty { listOfNotNull(singlePreviewFrame) }
+            val resolvedSingleFrame = activeProjectFrames.firstOrNull() ?: singlePreviewFrame
+
             val liveEditedClip = activeClip.copy(
                 title = editTitle,
                 startSec = editStartSec.roundToLong(),
-                endSec = editEndSec.roundToLong().coerceAtLeast(editStartSec.roundToLong() + 1L),
+                endSec = editEndSec.roundToLong().coerceAtLeast(editStartSec.roundToLong() + 22L),
                 reframeFocusX = editReframeX.roundToLong(),
                 subtitlesEnabled = editSubtitlesOn,
                 subtitleText = editSubtitleText,
@@ -348,7 +357,8 @@ fun ClipReviewStudioScreen(
                     clip = liveEditedClip,
                     extendedConfig = activeExtendedConfig,
                     campaign = activeCampaign,
-                    sourcePreviewFrame = singlePreviewFrame,
+                    sourcePreviewFrame = resolvedSingleFrame,
+                    sourcePreviewFrames = activeProjectFrames,
                     currentPlayheadSec = currentPlayheadSec,
                     onPlayheadChanged = { currentPlayheadSec = it }
                 )
@@ -620,7 +630,7 @@ fun ClipReviewStudioScreen(
                         )
 
                         Text(
-                            text = "Adjustable Clip Trim: ${editStartSec.roundToLong()}s to ${editEndSec.roundToLong()}s (Duration: ${(editEndSec.roundToLong() - editStartSec.roundToLong()).coerceAtLeast(1L)}s)",
+                            text = "Adjustable Viral Clip Trim (>20s Enforced): ${editStartSec.roundToLong()}s to ${editEndSec.roundToLong()}s (Duration: ${(editEndSec.roundToLong() - editStartSec.roundToLong()).coerceAtLeast(22L)}s)",
                             style = MaterialTheme.typography.labelSmall,
                             color = TextPrimary
                         )
@@ -628,18 +638,18 @@ fun ClipReviewStudioScreen(
                             value = editStartSec,
                             onValueChange = {
                                 editStartSec = it
-                                if (editEndSec <= editStartSec + 5f) {
-                                    editEndSec = (editStartSec + 15f).coerceAtMost(maxProjDuration)
+                                if (editEndSec < editStartSec + 22f) {
+                                    editEndSec = (editStartSec + 26f).coerceAtMost(maxProjDuration)
                                 }
                             },
-                            valueRange = 0f..(maxProjDuration - 5f).coerceAtLeast(10f)
+                            valueRange = 0f..(maxProjDuration - 22f).coerceAtLeast(10f)
                         )
                         Slider(
                             value = editEndSec,
                             onValueChange = {
-                                editEndSec = it.coerceAtLeast(editStartSec + 5f)
+                                editEndSec = it.coerceAtLeast(editStartSec + 22f)
                             },
-                            valueRange = 5f..maxProjDuration
+                            valueRange = 22f..maxProjDuration.coerceAtLeast(30f)
                         )
                     }
                 }
