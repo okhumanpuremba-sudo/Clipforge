@@ -11,6 +11,7 @@ object WhopRuleValidator {
 
     fun validateClip(clip: ClipCandidate, campaign: WhopCampaign): CampaignValidationReport {
         val checks = mutableListOf<CampaignValidationCheck>()
+        val ext = clip.extendedConfig
 
         // 1. Duration Bounds Check
         val duration = clip.durationSec
@@ -23,30 +24,47 @@ object WhopRuleValidator {
                     "Clip duration ${duration}s is within campaign bounds."
                 } else {
                     "Clip is ${duration}s; must be between ${campaign.minDurationSec}s and ${campaign.maxDurationSec}s."
-                }
+                },
+                isBlockingConflict = !durationOk
             )
         )
 
-        // 2. Aspect Ratio Preference Check
+        // 2. Aspect Ratio & Dynamic Layout Check
         val targetAspect = campaign.preferredAspectRatio.ifBlank { "9:16" }
-        val aspectOk = clip.aspectRatio == targetAspect
+        val unreviewedLowConf = ext?.segments?.count { it.needsManualReview } ?: 0
+        val aspectOk = clip.aspectRatio == targetAspect && unreviewedLowConf == 0
+        val layoutSummary = ext?.segments?.joinToString(" → ") { "${it.layoutType.id}(${it.startSec}s-${it.endSec}s)" }
+            ?: "9:16 Focus X: ${clip.reframeFocusX}%"
         checks.add(
             CampaignValidationCheck(
-                ruleName = "Aspect Ratio Preference ($targetAspect • ${campaign.targetPlatform})",
+                ruleName = "Aspect Ratio & Dynamic Layout ($targetAspect • ${campaign.targetPlatform})",
                 passed = aspectOk,
-                detail = if (aspectOk) {
-                    "$targetAspect framing active (Subject Focus X: ${clip.reframeFocusX}%)."
-                } else {
-                    "Current aspect ratio is ${clip.aspectRatio}; campaign requires $targetAspect."
-                }
+                detail = when {
+                    clip.aspectRatio != targetAspect -> "Current aspect ratio is ${clip.aspectRatio}; campaign requires $targetAspect."
+                    unreviewedLowConf > 0 -> "$unreviewedLowConf timeline segment(s) flagged for low-confidence manual review."
+                    else -> "$targetAspect active • Dynamic Timeline: $layoutSummary"
+                },
+                isBlockingConflict = !aspectOk
             )
         )
 
-        // 3. Campaign Logo Placement & Local Custom Logo File Check
+        // 3. Campaign Logo Placement ON/OFF Toggle & Conflict Check
         val hasLocalLogoFile = campaign.customLogoLocalPath.isNotBlank() &&
             File(campaign.customLogoLocalPath).exists()
-        val logoOk = campaign.logoPlacement == "NONE" ||
-            (clip.logoPlacement == campaign.logoPlacement && campaign.requiredLogoAsset.isNotBlank())
+        val effectiveLogoEnabled = ext?.logoConfig?.enabled ?: (clip.logoPlacement != "NONE")
+        val effectiveLogoPos = if (effectiveLogoEnabled) {
+            ext?.logoConfig?.position?.takeIf { it != "NONE" } ?: clip.logoPlacement
+        } else {
+            "NONE"
+        }
+        val campaignRequiresLogo = campaign.logoPlacement != "NONE"
+        val logoOk = if (!campaignRequiresLogo) {
+            !effectiveLogoEnabled || effectiveLogoPos == "NONE"
+        } else {
+            effectiveLogoEnabled &&
+                effectiveLogoPos == campaign.logoPlacement &&
+                campaign.requiredLogoAsset.isNotBlank()
+        }
         val logoSourceNote = if (hasLocalLogoFile) {
             "Verified local file '${campaign.requiredLogoAsset}'"
         } else {
@@ -54,33 +72,67 @@ object WhopRuleValidator {
         }
         checks.add(
             CampaignValidationCheck(
-                ruleName = "Custom Logo & Watermark (${campaign.logoPlacement})",
+                ruleName = "Logo Placement Toggle (${if (effectiveLogoEnabled) "ON • $effectiveLogoPos" else "OFF"})",
                 passed = logoOk,
-                detail = if (logoOk) {
-                    "$logoSourceNote locked at ${clip.logoPlacement} inside safe zone."
-                } else {
-                    "Clip logo is at ${clip.logoPlacement}; campaign requires ${campaign.logoPlacement} (${campaign.requiredLogoAsset})."
-                }
+                detail = when {
+                    !campaignRequiresLogo && effectiveLogoEnabled ->
+                        "CONFLICT: Campaign '${campaign.name}' prohibits brand logos (NONE), but Logo Placement is ON ($effectiveLogoPos)."
+                    campaignRequiresLogo && !effectiveLogoEnabled ->
+                        "CONFLICT: Campaign requires logo '${campaign.requiredLogoAsset}' at ${campaign.logoPlacement}, but Logo Placement is toggled OFF."
+                    logoOk && !campaignRequiresLogo ->
+                        "Logo Placement is OFF as required by campaign — full 9:16 layout space active."
+                    logoOk ->
+                        "$logoSourceNote active at $effectiveLogoPos (size ${ext?.logoConfig?.sizePct ?: 14}%, opacity ${ext?.logoConfig?.opacityPct ?: 95}%)."
+                    else ->
+                        "CONFLICT: Logo is at $effectiveLogoPos; campaign requires ${campaign.logoPlacement} (${campaign.requiredLogoAsset})."
+                },
+                isBlockingConflict = !logoOk
             )
         )
 
-        // 4. Safe Zone & Subtitle Collision Check (Respects Video Captions ON/OFF toggle)
+        // 4. Hook Caption Placement Toggle (Independent of Ordinary Subtitles)
+        val hookCfg = ext?.hookConfig
+        val hookEnabled = hookCfg?.enabled ?: true
+        val hookText = hookCfg?.hookText ?: clip.title
+        val hookPos = hookCfg?.position ?: "TOP_SAFE"
+        val hookValidWhenOn = hookText.isNotBlank() &&
+            (hookCfg?.durationSec ?: 3.5f) in 1.0f..15.0f &&
+            hookPos in listOf("TOP_SAFE", "UPPER_MIDDLE", "ABOVE_SPLIT_LINE", "CENTER_BANNER")
+        val hookOk = if (hookEnabled) hookValidWhenOn else true
+        checks.add(
+            CampaignValidationCheck(
+                ruleName = "Hook Caption Toggle (${if (hookEnabled) "ON • $hookPos" else "OFF"})",
+                passed = hookOk,
+                detail = when {
+                    !hookEnabled ->
+                        "Opening Hook Caption toggled OFF (Dialogue Subtitles remain ${if (clip.subtitlesEnabled) "ON" else "OFF"})."
+                    hookOk ->
+                        "Hook Caption ON (\"${hookText.take(36)}\") at $hookPos for ${hookCfg?.durationSec ?: 3.5f}s — clears face & HUD."
+                    else ->
+                        "CONFLICT: Hook Caption is ON but hook text is empty or outside safe zones."
+                },
+                isBlockingConflict = !hookOk
+            )
+        )
+
+        // 5. Safe Zone & Dialogue Subtitle Check (Independent of Hook Caption)
         val safeMarginsValid = campaign.safeZoneTopPct in 5..35 && campaign.safeZoneBottomPct in 10..35
         val safeZoneOk = safeMarginsValid && (!clip.subtitlesEnabled || clip.subtitleText.isNotBlank())
         checks.add(
             CampaignValidationCheck(
-                ruleName = "Platform Safe Zones (Top ${campaign.safeZoneTopPct}% / Bottom ${campaign.safeZoneBottomPct}%)",
+                ruleName = "Dialogue Subtitles & Safe Zones (Top ${campaign.safeZoneTopPct}% / Bottom ${campaign.safeZoneBottomPct}%)",
                 passed = safeZoneOk,
                 detail = when {
                     !safeMarginsValid -> "Safe-zone margins must be 5–35% top and 10–35% bottom."
-                    !clip.subtitlesEnabled -> "Video captions toggled OFF by creator — safe zones clear."
-                    safeZoneOk -> "Burned-in viral captions clear top ${campaign.safeZoneTopPct}% and bottom ${campaign.safeZoneBottomPct}% UI overlays."
-                    else -> "Provide non-empty viral video caption text or toggle video captions OFF."
-                }
+                    !clip.subtitlesEnabled -> "Dialogue subtitles toggled OFF — Hook Caption (${if (hookEnabled) "ON" else "OFF"}) operates independently."
+                    safeZoneOk -> "Synchronized SRT subtitles clear top ${campaign.safeZoneTopPct}% and bottom ${campaign.safeZoneBottomPct}% UI overlays."
+                    else -> "Provide non-empty dialogue subtitle text or toggle subtitles OFF."
+                },
+                isBlockingConflict = !safeZoneOk
             )
         )
 
-        // 5. Required Hashtags Check
+        // 6. Required Hashtags Check
         val requiredTags = campaign.requiredHashtags
             .split(" ", ",")
             .map { it.trim() }
@@ -96,11 +148,12 @@ object WhopRuleValidator {
                     "All mandatory hashtags present (${requiredTags.joinToString(" ")})."
                 } else {
                     "Missing required hashtags: ${missingTags.joinToString(" ")}"
-                }
+                },
+                isBlockingConflict = !hashtagsOk
             )
         )
 
-        // 6. Mandatory Caption CTA Check
+        // 7. Mandatory Caption CTA Check
         val ctaRequired = campaign.mandatoryCaptionCta.trim()
         val ctaOk = ctaRequired.isEmpty() ||
             clip.captionText.contains(ctaRequired, ignoreCase = true)
@@ -112,11 +165,12 @@ object WhopRuleValidator {
                     "Caption includes required CTA: \"$ctaRequired\"."
                 } else {
                     "Caption is missing mandatory CTA phrase: \"$ctaRequired\"."
-                }
+                },
+                isBlockingConflict = !ctaOk
             )
         )
 
-        // 7. SEO Guidance & Confidence Threshold Check
+        // 8. SEO Guidance & Confidence Threshold Check
         val seoOk = clip.seoTitle.length in 15..100 &&
             clip.seoKeywords.isNotBlank() &&
             clip.confidenceScore >= campaign.minConfidenceScore
@@ -128,7 +182,8 @@ object WhopRuleValidator {
                     "Confidence ${clip.confidenceScore}% meets threshold; SEO title & keywords populated."
                 } else {
                     "Requires confidence >= ${campaign.minConfidenceScore}% (currently ${clip.confidenceScore}%) and non-empty SEO title/keywords."
-                }
+                },
+                isBlockingConflict = !seoOk
             )
         )
 
@@ -175,11 +230,14 @@ object WhopRuleValidator {
             "9:16"
         }
 
-        return clip.copy(
+        val resolvedLogoPlacement = if (campaign.logoPlacement == "NONE") "NONE" else campaign.logoPlacement
+        val resolvedLogoEnabled = campaign.logoPlacement != "NONE"
+
+        val baseUpdated = clip.copy(
             campaignId = campaign.id,
             endSec = adjustedEnd,
             aspectRatio = validAspect,
-            logoPlacement = if (campaign.logoPlacement == "NONE") clip.logoPlacement else campaign.logoPlacement,
+            logoPlacement = resolvedLogoPlacement,
             subtitlesEnabled = clip.subtitlesEnabled,
             subtitleText = clip.subtitleText.ifBlank { "[00:00] ${clip.title.uppercase()}" },
             captionText = updatedCaption,
@@ -188,6 +246,34 @@ object WhopRuleValidator {
             seoKeywords = clip.seoKeywords.ifBlank { "${campaign.brandName}, whop clips, ${clip.category.lowercase()}" },
             confidenceScore = clip.confidenceScore.coerceAtLeast(campaign.minConfidenceScore)
         )
+
+        val existingExt = clip.extendedConfig ?: AutoFramingEngine.generateDefaultExtendedConfig(baseUpdated, campaign = campaign)
+        val fixedSegments = existingExt.segments.map { seg ->
+            seg.copy(
+                needsManualReview = false,
+                manualReviewReason = "",
+                confidence = seg.confidence.coerceAtLeast(0.88f)
+            )
+        }
+        val fixedExt = existingExt.copy(
+            segments = AutoFramingEngine.applyHysteresisAndSmoothing(
+                segments = fixedSegments,
+                minSegmentDurationSec = existingExt.hysteresisMinSegmentSec,
+                clipStartSec = baseUpdated.startSec,
+                clipEndSec = baseUpdated.endSec
+            ),
+            logoConfig = existingExt.logoConfig.copy(
+                enabled = resolvedLogoEnabled,
+                position = resolvedLogoPlacement
+            ),
+            hookConfig = existingExt.hookConfig.copy(
+                hookText = existingExt.hookConfig.hookText.ifBlank {
+                    AutoFramingEngine.buildDefaultHookText(baseUpdated, campaign)
+                },
+                position = "TOP_SAFE"
+            )
+        )
+        return baseUpdated.copy(extendedConfig = fixedExt)
     }
 
     /**

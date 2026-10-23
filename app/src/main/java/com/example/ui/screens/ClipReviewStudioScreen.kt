@@ -73,10 +73,16 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.runtime.mutableLongStateOf
 import com.example.data.model.ClipCandidate
+import com.example.data.model.ExportQualityConfig
 import com.example.data.model.HighlightCategory
+import com.example.data.model.HookCaptionConfig
+import com.example.data.model.LogoPlacementConfig
+import com.example.data.model.VerticalLayoutType
 import com.example.data.model.VideoProject
 import com.example.data.model.WhopCampaign
+import com.example.domain.AutoFramingEngine
 import com.example.domain.WhopRuleValidator
 import com.example.ui.theme.ForgeAmber
 import com.example.ui.theme.StudioBorder
@@ -106,16 +112,28 @@ fun ClipReviewStudioScreen(
     lastExportSummary: String?,
     lastExportFfmpegCommand: String?,
     lastExportSrtPreview: String?,
+    lastGallerySaveMessage: String? = null,
+    isSavingToGallery: Boolean = false,
     onSelectClip: (String, String, Long) -> Unit,
     onUpdateClip: (ClipCandidate) -> Unit,
     onAutoFixForCampaign: (ClipCandidate, WhopCampaign) -> Unit,
-    onExportClip: (ClipCandidate, WhopCampaign?, VideoProject?) -> Unit
+    onExportClip: (ClipCandidate, WhopCampaign?, VideoProject?) -> Unit,
+    onOverrideSegment: (ClipCandidate, String, VerticalLayoutType?, Float?, List<Int>?) -> Unit = { _, _, _, _, _ -> },
+    onSplitSegment: (ClipCandidate, String) -> Unit = { _, _ -> },
+    onMergeSegmentWithNext: (ClipCandidate, String) -> Unit = { _, _ -> },
+    onUpdateLogoToggle: (ClipCandidate, LogoPlacementConfig, WhopCampaign?) -> Unit = { _, _, _ -> },
+    onUpdateHookToggle: (ClipCandidate, HookCaptionConfig) -> Unit = { _, _ -> },
+    onUpdateExportConfig: (ClipCandidate, ExportQualityConfig) -> Unit = { _, _ -> },
+    onSaveToGallery: (ClipCandidate, WhopCampaign?, VideoProject?) -> Unit = { _, _, _ -> },
+    onRenameClip: (ClipCandidate, String) -> Unit = { _, _ -> },
+    onDeleteClip: (String) -> Unit = {}
 ) {
     val context = LocalContext.current
     val clipboardManager = LocalClipboardManager.current
     val textToolbar = LocalTextToolbar.current
     var statusFilter by rememberSaveable { mutableStateOf("ALL") }
     var seoCopyFeedback by remember { mutableStateOf<String?>(null) }
+    var approvalBlockedFeedback by remember { mutableStateOf<String?>(null) }
 
     val filteredClips = remember(clips, selectedProjectId, statusFilter) {
         clips.filter { clip ->
@@ -141,6 +159,7 @@ fun ClipReviewStudioScreen(
     var editSeoTitle by remember(activeClip?.id) { mutableStateOf(activeClip?.seoTitle.orEmpty()) }
     var editSeoKeywords by remember(activeClip?.id) { mutableStateOf(activeClip?.seoKeywords.orEmpty()) }
     var editLogoPos by remember(activeClip?.id) { mutableStateOf(activeClip?.logoPlacement ?: "TOP_RIGHT") }
+    var currentPlayheadSec by remember(activeClip?.id) { mutableLongStateOf(activeClip?.startSec ?: 0L) }
 
     LaunchedEffect(
         activeClip?.title,
@@ -166,6 +185,10 @@ fun ClipReviewStudioScreen(
             editSeoTitle = activeClip.seoTitle
             editSeoKeywords = activeClip.seoKeywords
             editLogoPos = activeClip.logoPlacement
+            if (currentPlayheadSec !in activeClip.startSec..activeClip.endSec) {
+                currentPlayheadSec = activeClip.startSec
+            }
+            approvalBlockedFeedback = null
         }
     }
 
@@ -297,6 +320,13 @@ fun ClipReviewStudioScreen(
                 }
             }
         } else {
+            val activeExtendedConfig = activeClip.extendedConfig
+                ?: AutoFramingEngine.generateDefaultExtendedConfig(
+                    clip = activeClip,
+                    project = parentProject,
+                    campaign = activeCampaign
+                )
+
             val liveEditedClip = activeClip.copy(
                 title = editTitle,
                 startSec = editStartSec.roundToLong(),
@@ -308,8 +338,79 @@ fun ClipReviewStudioScreen(
                 hashtags = editHashtags,
                 seoTitle = editSeoTitle,
                 seoKeywords = editSeoKeywords,
-                logoPlacement = editLogoPos
+                logoPlacement = if (activeExtendedConfig.logoConfig.enabled) editLogoPos else "NONE",
+                extendedConfig = activeExtendedConfig
             )
+
+            // 2A. In-App Vertical Video Player & Original vs. 9:16 Split Compare
+            item {
+                InAppVerticalVideoPlayerCard(
+                    clip = liveEditedClip,
+                    extendedConfig = activeExtendedConfig,
+                    campaign = activeCampaign,
+                    sourcePreviewFrame = singlePreviewFrame,
+                    currentPlayheadSec = currentPlayheadSec,
+                    onPlayheadChanged = { currentPlayheadSec = it }
+                )
+            }
+
+            // 2B. AI Auto-Framing & Dynamic Layout Switching Timeline Editor
+            item {
+                EditableDynamicLayoutTimelineCard(
+                    clip = liveEditedClip,
+                    extendedConfig = activeExtendedConfig,
+                    currentPlayheadSec = currentPlayheadSec,
+                    onSeekPlayhead = { currentPlayheadSec = it },
+                    onOverrideSegment = { segId, newLayout, newZoom, activeSpk ->
+                        onOverrideSegment(liveEditedClip, segId, newLayout, newZoom, activeSpk)
+                    },
+                    onSplitSegment = { segId ->
+                        onSplitSegment(liveEditedClip, segId)
+                    },
+                    onMergeSegmentWithNext = { segId ->
+                        onMergeSegmentWithNext(liveEditedClip, segId)
+                    }
+                )
+            }
+
+            // 2C. Dedicated Logo Placement ON/OFF Toggle Card
+            item {
+                LogoPlacementToggleCard(
+                    logoConfig = activeExtendedConfig.logoConfig,
+                    activeCampaign = activeCampaign,
+                    onUpdateLogoConfig = { updatedLogo ->
+                        editLogoPos = if (updatedLogo.enabled) updatedLogo.position else "NONE"
+                        onUpdateLogoToggle(liveEditedClip, updatedLogo, activeCampaign)
+                    }
+                )
+            }
+
+            // 2D. Dedicated Hook Caption Placement ON/OFF Toggle Card (Independent of Subtitles)
+            item {
+                HookCaptionPlacementToggleCard(
+                    hookConfig = activeExtendedConfig.hookConfig,
+                    subtitlesEnabled = editSubtitlesOn,
+                    onUpdateHookConfig = { updatedHook ->
+                        onUpdateHookToggle(liveEditedClip, updatedHook)
+                    }
+                )
+            }
+
+            // 2E. Save Finished Video to Android Gallery Card
+            item {
+                SaveToAndroidGalleryCard(
+                    clip = liveEditedClip,
+                    extendedConfig = activeExtendedConfig,
+                    isSavingToGallery = isSavingToGallery,
+                    lastGallerySaveMessage = lastGallerySaveMessage,
+                    onUpdateExportConfig = { updatedExport ->
+                        onUpdateExportConfig(liveEditedClip, updatedExport)
+                    },
+                    onSaveToGallery = {
+                        onSaveToGallery(liveEditedClip, activeCampaign, parentProject)
+                    }
+                )
+            }
 
             // 2. Interactive 9:16 Vertical Reframe & Safe-Zone Canvas Preview
             item {
@@ -915,12 +1016,31 @@ fun ClipReviewStudioScreen(
                         }
 
                         // Editorial Review Actions: Save / Approve / Reject / Export
+                        if (approvalBlockedFeedback != null) {
+                            Surface(
+                                color = WarningCoral.copy(alpha = 0.16f),
+                                shape = RoundedCornerShape(8.dp),
+                                border = BorderStroke(1.dp, WarningCoral),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("approval_blocked_warning")
+                            ) {
+                                Text(
+                                    text = approvalBlockedFeedback.orEmpty(),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = WarningCoral,
+                                    modifier = Modifier.padding(10.dp)
+                                )
+                            }
+                        }
+
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             OutlinedButton(
                                 onClick = {
+                                    approvalBlockedFeedback = null
                                     onUpdateClip(liveEditedClip.copy(reviewStatus = "REJECTED"))
                                 },
                                 modifier = Modifier
@@ -935,7 +1055,14 @@ fun ClipReviewStudioScreen(
 
                             Button(
                                 onClick = {
-                                    onUpdateClip(liveEditedClip.copy(reviewStatus = "APPROVED"))
+                                    val report = activeCampaign?.let { WhopRuleValidator.validateClip(liveEditedClip, it) }
+                                    if (report != null && report.blockingConflicts.isNotEmpty()) {
+                                        val firstConflict = report.blockingConflicts.first()
+                                        approvalBlockedFeedback = "Final Approval Blocked by Campaign Rule: ${firstConflict.ruleName} — ${firstConflict.detail} Tap 'Auto-Fix Clip' above or resolve conflict."
+                                    } else {
+                                        approvalBlockedFeedback = null
+                                        onUpdateClip(liveEditedClip.copy(reviewStatus = "APPROVED"))
+                                    }
                                 },
                                 colors = ButtonDefaults.buttonColors(
                                     containerColor = VerifiedEmerald,
@@ -999,7 +1126,7 @@ fun ClipReviewStudioScreen(
                             }
                             if (lastExportFfmpegCommand != null) {
                                 Text(
-                                    text = "Generated 9:16 FFmpeg Filtergraph Command (For Backend Render Worker):",
+                                    text = "Generated 9:16 Dynamic FFmpeg Filtergraph Command (Termux & Backend Render Worker):",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = TextSecondary
                                 )
@@ -1040,6 +1167,26 @@ fun ClipReviewStudioScreen(
                         }
                     }
                 }
+            }
+
+            // 6. Full Clip Library Explorer & Manager
+            item {
+                ClipLibraryExplorerCard(
+                    clips = clips,
+                    projects = projects,
+                    campaigns = campaigns,
+                    activeClipId = activeClip.id,
+                    onSelectAndReopenClip = { chosenClip, chosenProj ->
+                        onSelectClip(
+                            chosenClip.id,
+                            chosenProj?.sourceUri.orEmpty(),
+                            chosenClip.startSec
+                        )
+                    },
+                    onRenameClip = onRenameClip,
+                    onDeleteClipConfirmed = onDeleteClip,
+                    onSaveClipToGallery = onSaveToGallery
+                )
             }
         }
     }

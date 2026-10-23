@@ -7,19 +7,29 @@ import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.ai.HighlightDetectionEngine
+import com.example.data.local.LocalClipTimelineStore
 import com.example.data.local.LocalWhopCampaignStore
 import com.example.data.model.AiProviderConfig
 import com.example.data.model.ApiUsageLog
 import com.example.data.model.CampaignPreset
 import com.example.data.model.ClipCandidate
+import com.example.data.model.ClipExtendedConfig
+import com.example.data.model.ExportQualityConfig
+import com.example.data.model.HookCaptionConfig
+import com.example.data.model.LogoPlacementConfig
+import com.example.data.model.NormalizedRect
 import com.example.data.model.ProviderVerificationState
+import com.example.data.model.VerticalLayoutType
 import com.example.data.model.VideoProject
 import com.example.data.model.WhopCampaign
 import com.example.data.repository.ClipForgeRepository
+import com.example.domain.AutoFramingEngine
 import com.example.domain.ClipExportResult
 import com.example.domain.UrlVideoIngestEngine
 import com.example.domain.VideoProcessingPipeline
 import com.example.domain.WhopRuleValidator
+import com.example.util.GallerySaveResult
+import com.example.util.GalleryVideoSaver
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -61,6 +71,10 @@ data class StudioUiState(
     val lastExportSummary: String? = null,
     val lastExportFfmpegCommand: String? = null,
     val lastExportSrtPreview: String? = null,
+    val lastGallerySaveMessage: String? = null,
+    val lastSavedMp4Path: String? = null,
+    val isSavingToGallery: Boolean = false,
+    val localExtendedConfigs: Map<String, ClipExtendedConfig> = emptyMap(),
     val uploadedPreviewFrames: Map<String, List<Bitmap>> = emptyMap(),
     val singleClipPreviewFrame: Bitmap? = null,
     val dailyTokenSoftLimit: Long = 25_000L,
@@ -117,6 +131,9 @@ class ClipForgeViewModel(
             }.orEmpty(),
             campaignPresets = appContext?.let {
                 LocalWhopCampaignStore.loadCampaignPresets(it, currentUserId)
+            }.orEmpty(),
+            localExtendedConfigs = appContext?.let {
+                LocalClipTimelineStore.loadAllConfigs(it)
             }.orEmpty()
         )
     )
@@ -166,13 +183,22 @@ class ClipForgeViewModel(
             )
 
     val clipsState: StateFlow<DataStreamState<List<ClipCandidate>>> =
-        repository.observeClips(currentUserId)
-            .map<List<ClipCandidate>, DataStreamState<List<ClipCandidate>>> { list ->
-                if (_studioState.value.selectedClipId == null && list.isNotEmpty()) {
-                    _studioState.update { it.copy(selectedClipId = list.first().id) }
-                }
-                DataStreamState.Success(list)
+        combine(
+            repository.observeClips(currentUserId),
+            _studioState.map { it.localExtendedConfigs }
+        ) { list, extMap ->
+            if (_studioState.value.selectedClipId == null && list.isNotEmpty()) {
+                _studioState.update { it.copy(selectedClipId = list.first().id) }
             }
+            val hydrated = list.map { clip ->
+                val ext = extMap[clip.id] ?: LocalClipTimelineStore.loadExtendedConfigForClip(
+                    context = appContext,
+                    clip = clip
+                )
+                clip.copy(extendedConfig = ext)
+            }
+            DataStreamState.Success(hydrated) as DataStreamState<List<ClipCandidate>>
+        }
             .catch { error ->
                 Log.w(TAG, "Error observing clips", error)
                 emit(DataStreamState.Error(error.message ?: "Failed to load clips"))
@@ -843,6 +869,10 @@ class ClipForgeViewModel(
 
     fun updateClipCandidate(updatedClip: ClipCandidate) {
         viewModelScope.launch {
+            val ext = updatedClip.extendedConfig
+            if (ext != null) {
+                saveExtendedConfigInternal(updatedClip.id, ext)
+            }
             val res = repository.updateClip(updatedClip)
             res.onFailure { err ->
                 _studioState.update { it.copy(errorBanner = err.localizedMessage ?: "Failed to update clip") }
@@ -850,11 +880,170 @@ class ClipForgeViewModel(
         }
     }
 
+    private fun saveExtendedConfigInternal(clipId: String, config: ClipExtendedConfig) {
+        val normalized = config.copy(clipId = clipId)
+        if (appContext != null) {
+            LocalClipTimelineStore.saveExtendedConfig(appContext, normalized)
+        }
+        _studioState.update { st ->
+            st.copy(localExtendedConfigs = st.localExtendedConfigs + (clipId to normalized))
+        }
+    }
+
+    fun updateClipExtendedConfig(
+        clip: ClipCandidate,
+        updatedConfig: ClipExtendedConfig,
+        syncLogoToFirestore: Boolean = true
+    ) {
+        saveExtendedConfigInternal(clip.id, updatedConfig)
+        if (syncLogoToFirestore) {
+            val resolvedLogo = if (updatedConfig.logoConfig.enabled) {
+                updatedConfig.logoConfig.position
+            } else {
+                "NONE"
+            }
+            if (clip.logoPlacement != resolvedLogo) {
+                updateClipCandidate(clip.copy(logoPlacement = resolvedLogo, extendedConfig = updatedConfig))
+            }
+        }
+    }
+
+    fun overrideTimelineSegment(
+        clip: ClipCandidate,
+        segmentId: String,
+        newLayoutType: VerticalLayoutType? = null,
+        newZoomLevel: Float? = null,
+        newWebcamRect: NormalizedRect? = null,
+        newContentRect: NormalizedRect? = null,
+        newActiveSpeakerIds: List<Int>? = null
+    ) {
+        val currentExt = clip.extendedConfig ?: LocalClipTimelineStore.loadExtendedConfigForClip(appContext, clip)
+        val updatedSegments = AutoFramingEngine.overrideSegment(
+            segments = currentExt.segments,
+            segmentId = segmentId,
+            newLayoutType = newLayoutType,
+            newZoomLevel = newZoomLevel,
+            newWebcamRect = newWebcamRect,
+            newContentRect = newContentRect,
+            newActiveSpeakerIds = newActiveSpeakerIds
+        )
+        val updatedExt = currentExt.copy(segments = updatedSegments, checkpointStage = "TIMELINE_EDITED")
+        saveExtendedConfigInternal(clip.id, updatedExt)
+        _studioState.update {
+            it.copy(
+                analysisStatusBanner = "Updated timeline segment to ${newLayoutType?.shortBadge ?: "custom override"}."
+            )
+        }
+    }
+
+    fun splitTimelineSegment(clip: ClipCandidate, segmentId: String, splitSec: Long? = null) {
+        val currentExt = clip.extendedConfig ?: LocalClipTimelineStore.loadExtendedConfigForClip(appContext, clip)
+        val updatedSegments = AutoFramingEngine.splitSegmentAt(currentExt.segments, segmentId, splitSec)
+        val updatedExt = currentExt.copy(segments = updatedSegments, checkpointStage = "TIMELINE_SPLIT")
+        saveExtendedConfigInternal(clip.id, updatedExt)
+        _studioState.update {
+            it.copy(analysisStatusBanner = "Split layout segment into ${updatedSegments.size} segments.")
+        }
+    }
+
+    fun mergeTimelineSegmentWithNext(clip: ClipCandidate, segmentId: String) {
+        val currentExt = clip.extendedConfig ?: LocalClipTimelineStore.loadExtendedConfigForClip(appContext, clip)
+        val updatedSegments = AutoFramingEngine.mergeSegmentWithNext(currentExt.segments, segmentId)
+        val updatedExt = currentExt.copy(segments = updatedSegments, checkpointStage = "TIMELINE_MERGED")
+        saveExtendedConfigInternal(clip.id, updatedExt)
+        _studioState.update {
+            it.copy(analysisStatusBanner = "Merged adjacent layout segments (${updatedSegments.size} remaining).")
+        }
+    }
+
+    fun updateLogoPlacementToggle(
+        clip: ClipCandidate,
+        logoConfig: LogoPlacementConfig,
+        activeCampaign: WhopCampaign? = null
+    ) {
+        val currentExt = clip.extendedConfig ?: LocalClipTimelineStore.loadExtendedConfigForClip(appContext, clip)
+        val updatedExt = currentExt.copy(logoConfig = logoConfig)
+        val newClipLogoField = if (logoConfig.enabled) logoConfig.position else "NONE"
+        updateClipExtendedConfig(clip, updatedExt, syncLogoToFirestore = true)
+
+        val conflictWarning = if (activeCampaign != null) {
+            when {
+                activeCampaign.logoPlacement != "NONE" && !logoConfig.enabled ->
+                    "Warning: Campaign '${activeCampaign.name}' requires logo at ${activeCampaign.logoPlacement}, but Logo Placement is now OFF."
+                activeCampaign.logoPlacement == "NONE" && logoConfig.enabled ->
+                    "Warning: Campaign '${activeCampaign.name}' prohibits brand logos, but Logo Placement is now ON."
+                activeCampaign.logoPlacement != "NONE" && logoConfig.position != activeCampaign.logoPlacement ->
+                    "Warning: Campaign requires logo at ${activeCampaign.logoPlacement} (currently ${logoConfig.position})."
+                else -> null
+            }
+        } else null
+
+        _studioState.update {
+            it.copy(
+                analysisStatusBanner = conflictWarning
+                    ?: "Logo Placement ${if (logoConfig.enabled) "ON ($newClipLogoField)" else "OFF — Full 9:16 layout space active"}."
+            )
+        }
+    }
+
+    fun updateHookCaptionToggle(
+        clip: ClipCandidate,
+        hookConfig: HookCaptionConfig
+    ) {
+        val currentExt = clip.extendedConfig ?: LocalClipTimelineStore.loadExtendedConfigForClip(appContext, clip)
+        val updatedExt = currentExt.copy(hookConfig = hookConfig)
+        saveExtendedConfigInternal(clip.id, updatedExt)
+        _studioState.update {
+            it.copy(
+                analysisStatusBanner = if (hookConfig.enabled) {
+                    "Hook Caption ON at ${hookConfig.position} (${hookConfig.durationSec}s) — independent of dialogue subtitles."
+                } else {
+                    "Hook Caption OFF — dialogue subtitles remain ${if (clip.subtitlesEnabled) "ON" else "OFF"}."
+                }
+            )
+        }
+    }
+
+    fun updateExportQualitySettings(
+        clip: ClipCandidate,
+        exportConfig: ExportQualityConfig
+    ) {
+        val currentExt = clip.extendedConfig ?: LocalClipTimelineStore.loadExtendedConfigForClip(appContext, clip)
+        val updatedExt = currentExt.copy(exportConfig = exportConfig)
+        saveExtendedConfigInternal(clip.id, updatedExt)
+    }
+
+    fun renameClip(clip: ClipCandidate, newTitle: String) {
+        val clean = newTitle.trim()
+        if (clean.isEmpty()) return
+        updateClipCandidate(clip.copy(title = clean))
+        _studioState.update {
+            it.copy(analysisStatusBanner = "Renamed clip to '$clean'.")
+        }
+    }
+
+    fun deleteClip(clipId: String) {
+        viewModelScope.launch {
+            if (appContext != null) {
+                LocalClipTimelineStore.deleteExtendedConfig(appContext, clipId)
+            }
+            repository.deleteClip(clipId)
+            _studioState.update { st ->
+                st.copy(
+                    selectedClipId = if (st.selectedClipId == clipId) null else st.selectedClipId,
+                    localExtendedConfigs = st.localExtendedConfigs - clipId,
+                    analysisStatusBanner = "Deleted clip from library."
+                )
+            }
+        }
+    }
+
     fun autoFixClipForCampaign(clip: ClipCandidate, campaign: WhopCampaign) {
         val fixed = WhopRuleValidator.autoFixClipForCampaign(clip, campaign)
+        fixed.extendedConfig?.let { saveExtendedConfigInternal(fixed.id, it) }
         updateClipCandidate(fixed)
         _studioState.update {
-            it.copy(analysisStatusBanner = "Applied Whop Campaign compliance fixes to '${clip.title}'.")
+            it.copy(analysisStatusBanner = "Applied Whop Campaign compliance fixes (Logo, Hook, CTA & Timeline) to '${clip.title}'.")
         }
     }
 
@@ -865,7 +1054,12 @@ class ClipForgeViewModel(
         project: VideoProject?
     ) {
         viewModelScope.launch {
-            val exportedClip = clip.copy(reviewStatus = "EXPORTED")
+            val ext = clip.extendedConfig ?: LocalClipTimelineStore.loadExtendedConfigForClip(context, clip, project, campaign)
+            val exportedClip = clip.copy(
+                reviewStatus = "EXPORTED",
+                logoPlacement = if (ext.logoConfig.enabled) ext.logoConfig.position else "NONE",
+                extendedConfig = ext
+            )
             repository.updateClip(exportedClip)
             if (project != null) {
                 repository.updateProjectStatus(project.id, "EXPORTED", project.clipCount, campaign?.id)
@@ -881,11 +1075,18 @@ class ClipForgeViewModel(
 
             when (result) {
                 is ClipExportResult.NativeMp4AndManifestSuccess -> {
+                    val updatedExt = ext.copy(
+                        localRenderedMp4Path = result.mp4File.absolutePath,
+                        checkpointStage = "EXPORTED_MP4",
+                        lastRenderError = ""
+                    )
+                    saveExtendedConfigInternal(clip.id, updatedExt)
                     _studioState.update {
                         it.copy(
-                            lastExportSummary = "EXPORTED WORKING MP4 CLIP (${result.mp4File.name}, ${result.mp4File.length() / 1024} KB) + SRT Subtitles (${result.srtFile.name}) + JSON Render Spec.",
+                            lastExportSummary = "EXPORTED WORKING MP4 CLIP (${result.mp4File.name}, ${result.mp4File.length() / 1024} KB) + SRT Subtitles (${result.srtFile.name}) + Dynamic Layout JSON Spec.",
                             lastExportFfmpegCommand = result.ffmpegCommand,
-                            lastExportSrtPreview = result.srtFile.readText().take(500)
+                            lastExportSrtPreview = result.srtFile.readText().take(500),
+                            lastSavedMp4Path = result.mp4File.absolutePath
                         )
                     }
                 }
@@ -901,7 +1102,94 @@ class ClipForgeViewModel(
                 }
 
                 is ClipExportResult.Error -> {
+                    val updatedExt = ext.copy(lastRenderError = result.message, checkpointStage = "EXPORT_FAILED")
+                    saveExtendedConfigInternal(clip.id, updatedExt)
                     _studioState.update { it.copy(errorBanner = "Export error: ${result.message}") }
+                }
+            }
+        }
+    }
+
+    /**
+     * Renders and saves the finished 9:16 vertical clip directly to the Android Gallery
+     * (`Movies/ClipForgeAI`) and verifies file existence, size > 0, and valid duration.
+     */
+    fun saveClipToGallery(
+        context: Context,
+        clip: ClipCandidate,
+        campaign: WhopCampaign?,
+        project: VideoProject?
+    ) {
+        if (_studioState.value.isSavingToGallery) return
+        viewModelScope.launch {
+            val ext = clip.extendedConfig ?: LocalClipTimelineStore.loadExtendedConfigForClip(context, clip, project, campaign)
+            _studioState.update {
+                it.copy(
+                    isSavingToGallery = true,
+                    analysisStatusBanner = "Rendering 9:16 vertical video (${ext.exportConfig.resolution} @ ${ext.exportConfig.fps}fps) & saving to Android Gallery...",
+                    errorBanner = null
+                )
+            }
+
+            val previewBmp = _studioState.value.singleClipPreviewFrame
+                ?: project?.id?.let { _studioState.value.uploadedPreviewFrames[it]?.firstOrNull() }
+
+            val saveRes = GalleryVideoSaver.saveClipToAndroidGallery(
+                context = context,
+                clip = clip.copy(extendedConfig = ext),
+                extendedConfig = ext,
+                campaign = campaign,
+                sourceFrame = previewBmp
+            )
+
+            when (saveRes) {
+                is GallerySaveResult.Success -> {
+                    val updatedExt = ext.copy(
+                        savedGalleryUri = saveRes.galleryUriString,
+                        savedGalleryPath = saveRes.folderPath,
+                        localRenderedMp4Path = saveRes.localMp4File.absolutePath,
+                        lastRenderError = "",
+                        checkpointStage = "SAVED_TO_GALLERY"
+                    )
+                    saveExtendedConfigInternal(clip.id, updatedExt)
+                    val exportedClip = clip.copy(
+                        reviewStatus = "EXPORTED",
+                        logoPlacement = if (ext.logoConfig.enabled) ext.logoConfig.position else "NONE",
+                        extendedConfig = updatedExt
+                    )
+                    repository.updateClip(exportedClip)
+
+                    val ffmpegCmd = VideoProcessingPipeline.buildFfmpegWorkerCommand(
+                        clip = exportedClip,
+                        campaign = campaign,
+                        sourceFileName = project?.sourceFileName ?: "source_video.mp4",
+                        sourceUriString = project?.sourceUri.orEmpty()
+                    )
+
+                    _studioState.update {
+                        it.copy(
+                            isSavingToGallery = false,
+                            lastGallerySaveMessage = "SAVED TO ANDROID GALLERY: ${saveRes.folderPath} (${saveRes.verification.detailMessage})",
+                            lastSavedMp4Path = saveRes.localMp4File.absolutePath,
+                            lastExportSummary = "Saved to Gallery: ${saveRes.folderPath} • Verified ${saveRes.sizeBytes} bytes, ${saveRes.durationSec}s duration.",
+                            lastExportFfmpegCommand = ffmpegCmd,
+                            analysisStatusBanner = "Saved '${saveRes.fileName}' to Android Gallery (${saveRes.folderPath}) — Ready for TikTok, Reels & Shorts!"
+                        )
+                    }
+                }
+
+                is GallerySaveResult.Error -> {
+                    val updatedExt = ext.copy(
+                        lastRenderError = saveRes.reason,
+                        checkpointStage = "GALLERY_SAVE_FAILED"
+                    )
+                    saveExtendedConfigInternal(clip.id, updatedExt)
+                    _studioState.update {
+                        it.copy(
+                            isSavingToGallery = false,
+                            errorBanner = "Gallery Save Failed: ${saveRes.reason}"
+                        )
+                    }
                 }
             }
         }

@@ -452,6 +452,8 @@ fun ClipForgeMainShell(
                                     lastExportSummary = studioState.lastExportSummary,
                                     lastExportFfmpegCommand = studioState.lastExportFfmpegCommand,
                                     lastExportSrtPreview = studioState.lastExportSrtPreview,
+                                    lastGallerySaveMessage = studioState.lastGallerySaveMessage,
+                                    isSavingToGallery = studioState.isSavingToGallery,
                                     onSelectClip = { clipId, sourceUri, startSec ->
                                         viewModel.selectClip(clipId, context, sourceUri, startSec)
                                     },
@@ -459,6 +461,39 @@ fun ClipForgeMainShell(
                                     onAutoFixForCampaign = viewModel::autoFixClipForCampaign,
                                     onExportClip = { clip, camp, proj ->
                                         viewModel.exportApprovedClip(context, clip, camp, proj)
+                                    },
+                                    onOverrideSegment = { clip, segId, newLayout, newZoom, activeSpk ->
+                                        viewModel.overrideTimelineSegment(
+                                            clip = clip,
+                                            segmentId = segId,
+                                            newLayoutType = newLayout,
+                                            newZoomLevel = newZoom,
+                                            newActiveSpeakerIds = activeSpk
+                                        )
+                                    },
+                                    onSplitSegment = { clip, segId ->
+                                        viewModel.splitTimelineSegment(clip, segId)
+                                    },
+                                    onMergeSegmentWithNext = { clip, segId ->
+                                        viewModel.mergeTimelineSegmentWithNext(clip, segId)
+                                    },
+                                    onUpdateLogoToggle = { clip, logoCfg, camp ->
+                                        viewModel.updateLogoPlacementToggle(clip, logoCfg, camp)
+                                    },
+                                    onUpdateHookToggle = { clip, hookCfg ->
+                                        viewModel.updateHookCaptionToggle(clip, hookCfg)
+                                    },
+                                    onUpdateExportConfig = { clip, exportCfg ->
+                                        viewModel.updateExportQualitySettings(clip, exportCfg)
+                                    },
+                                    onSaveToGallery = { clip, camp, proj ->
+                                        viewModel.saveClipToGallery(context, clip, camp, proj)
+                                    },
+                                    onRenameClip = { clip, newTitle ->
+                                        viewModel.renameClip(clip, newTitle)
+                                    },
+                                    onDeleteClip = { clipId ->
+                                        viewModel.deleteClip(clipId)
                                     }
                                 )
                             }
