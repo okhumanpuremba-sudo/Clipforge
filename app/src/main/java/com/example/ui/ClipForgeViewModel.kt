@@ -718,29 +718,63 @@ class ClipForgeViewModel(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                Log.e(TAG, "AI highlight pipeline failed", e)
-                repository.updateProjectStatus(project.id, "READY", project.clipCount, campaign?.id)
+                Log.w(TAG, "Cloud AI pipeline unavailable (${e.localizedMessage}); auto-failing over to On-Device Viral Clipper", e)
                 repository.recordApiUsage(
                     ApiUsageLog(
                         providerId = "firebase_ai_primary",
                         modelName = "gemini-3.8-flash",
-                        operation = "detect_highlights ($desiredCount clips)",
+                        operation = "detect_highlights_auto_failover ($desiredCount clips)",
                         latencyMs = 0L,
                         estimatedTokens = 0L,
                         retryCount = stateSnap.maxRetryCount.toLong(),
                         success = false,
-                        errorMessage = e.localizedMessage ?: "Pipeline failed"
+                        errorMessage = e.localizedMessage ?: "Switched to On-Device Viral Clipper"
                     )
                 )
+
                 _studioState.update {
                     it.copy(
-                        isAnalyzingHighlights = false,
-                        pipelineProgress = 0f,
-                        pipelineStageLabel = "",
-                        analysisStatusBanner = null,
-                        errorBanner = "AI Pipeline Error: ${e.localizedMessage ?: "Generation failed."} Tip: If you hit a token/quota limit, tap '0-Token Local Clipper' below."
+                        pipelineProgress = 0.78f,
+                        pipelineStageLabel = "Step 4/4: Extracting $desiredCount viral clip(s) via On-Device Rule Engine...",
+                        analysisStatusBanner = "Auto-switched to On-Device Viral Clipper — extracting $desiredCount clip(s) with ${stateSnap.viralCaptionStyle.replace("_", " ")} captions...",
+                        errorBanner = null
                     )
                 }
+
+                val fallbackClips = WhopRuleValidator.extractClipsWithoutAiTokens(
+                    project = project,
+                    campaign = campaign,
+                    desiredClipCount = desiredCount,
+                    includeVideoCaptions = stateSnap.includeVideoCaptions,
+                    viralCaptionStyle = stateSnap.viralCaptionStyle
+                )
+
+                var firstFallbackClipId: String? = null
+                fallbackClips.forEach { candidate ->
+                    val saved = repository.createClip(candidate)
+                    if (firstFallbackClipId == null && saved.isSuccess) {
+                        firstFallbackClipId = saved.getOrNull()
+                    }
+                }
+
+                repository.updateProjectStatus(
+                    projectId = project.id,
+                    status = "CLIPS_GENERATED",
+                    clipCount = fallbackClips.size.toLong(),
+                    campaignId = campaign?.id
+                )
+
+                _studioState.update { st ->
+                    st.copy(
+                        isAnalyzingHighlights = false,
+                        pipelineProgress = 1.0f,
+                        pipelineStageLabel = "Complete (100%) — ${fallbackClips.size} viral clip(s) ready!",
+                        selectedClipId = firstFallbackClipId ?: st.selectedClipId,
+                        errorBanner = null,
+                        analysisStatusBanner = "Generated ${fallbackClips.size} viral clip(s) with ${stateSnap.viralCaptionStyle.replace("_", " ")} captions (${if (stateSnap.includeVideoCaptions) "ON" else "OFF"})."
+                    )
+                }
+                onCompleteNavigateToReview()
             }
         }
     }

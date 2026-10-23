@@ -248,6 +248,11 @@ class HighlightDetectionEngine {
             } catch (e: Exception) {
                 Log.e(TAG, "Highlight generation failed on attempt ${attempt + 1} ($activeModelName)", e)
                 lastException = e
+                val msg = e.message.orEmpty().lowercase()
+                if (msg.contains("app check") || msg.contains("attestation") || msg.contains("403")) {
+                    // App Check token rejection applies to all Firebase AI models; exit retry loop immediately for instant failover
+                    break
+                }
             }
 
             attempt++
